@@ -1,0 +1,70 @@
+name: Daily SEC Filing Check
+
+on:
+  schedule:
+    - cron: '17 11 * * 2-6'
+  workflow_dispatch:
+
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install -r requirements.txt
+
+      - name: Get the latest EDGAR filings
+        run: python sec_daily_watcher.py
+
+      - name: Check for insider-selling clusters
+        run: python form4_cluster_check.py
+
+      - name: Check for going concern language
+        run: python going_concern_check.py
+
+      - name: Look up tickers
+        run: python ticker_lookup.py
+
+      - name: First scoring pass
+        run: python scoring_engine.py --no-market
+
+      - name: Pull market data for the top names
+        env:
+          ALPHA_VANTAGE_KEY: ${{ secrets.ALPHA_VANTAGE_KEY }}
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+        run: python market_enrichment.py
+
+      - name: Final scoring pass
+        run: python scoring_engine.py
+
+      - name: Build the dashboard
+        run: python generate_dashboard.py
+
+      - name: Email the reports
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "Daily SEC Signal Report"
+          to: ${{ secrets.EMAIL_TO }}
+          from: SEC Filing Watcher
+          body: "Attached: the ranked report (open dashboard.html first) plus the raw data files."
+          attachments: dashboard.html,daily_signals_ranked.csv,form4_clusters.csv,going_concern_flags.csv,market_context.csv,all_filings.csv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: daily-reports
+          path: |
+            dashboard.html
+            daily_signals_ranked.csv
+            form4_clusters.csv
+            going_concern_flags.csv
+            market_context.csv
+            all_filings.csv
