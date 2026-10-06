@@ -68,7 +68,7 @@ def summarize(report, mode):
     else:
         lines.append("  - none")
 
-    lines += ["", "OPEN OPTION SPREADS"]
+    lines += ["", "OPEN OPTIONS"]
     if report["option_rows"]:
         for o in report["option_rows"]:
             pnl = f"${o['pnl']:,.0f}" if o["pnl"] is not None else "no price"
