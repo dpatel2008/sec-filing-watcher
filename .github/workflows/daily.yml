@@ -7,8 +7,10 @@ on:
 
 jobs:
   run-script:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -44,6 +46,14 @@ jobs:
 
       - name: Build the dashboard
         run: python generate_dashboard.py
+
+      - name: Save results to the repo
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add -f daily_signals_ranked.csv
+          git commit -m "Update daily results" || echo "Nothing new to save"
+          git push
 
       - name: Email the reports
         uses: dawidd6/action-send-mail@v3
