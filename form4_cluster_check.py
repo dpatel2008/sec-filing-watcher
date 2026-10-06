@@ -23,8 +23,24 @@ HEADERS = {
 INPUT_CSV = "all_filings.csv"
 OUTPUT_CSV = "form4_clusters.csv"
 
-SLEEP_BETWEEN_REQUESTS = 0.2
+SLEEP_BETWEEN_REQUESTS = 0.35
 MAX_FORM4_TO_CHECK = 2500
+MAX_ERRORS_IN_A_ROW = 5
+
+
+def get_with_retry(url, headers, stream=False, timeout=30, tries=3):
+    """Gets a page from the SEC. If the SEC says "slow down" (429 or 503), waits and tries again."""
+    resp = None
+    for attempt in range(1, tries + 1):
+        resp = requests.get(url, headers=headers, stream=stream, timeout=timeout)
+        if resp.status_code in (429, 503) and attempt < tries:
+            wait = 20 * attempt
+            print(f"  The SEC asked us to slow down ({resp.status_code}). Waiting {wait} seconds...")
+            resp.close()
+            time.sleep(wait)
+            continue
+        return resp
+    return resp
 
 
 def normalize_cik(raw) -> str:
@@ -96,11 +112,13 @@ def main():
     print(f"Checking {len(form4_rows)} unique Form 4 filing(s)...")
 
     groups = {}
+    errors_in_a_row = 0
 
     for row in form4_rows:
         try:
-            resp = requests.get(row["url"], headers=HEADERS, timeout=20)
+            resp = get_with_retry(row["url"], HEADERS, timeout=20)
             resp.raise_for_status()
+            errors_in_a_row = 0
 
             parsed = None
             for xml_block in extract_xml_blocks(resp.text):
@@ -128,6 +146,10 @@ def main():
 
         except requests.RequestException as e:
             print(f"  Error fetching {row['url']}: {e}")
+            errors_in_a_row += 1
+            if errors_in_a_row >= MAX_ERRORS_IN_A_ROW:
+                print("  Too many errors in a row. Stopping this check early and keeping what we have.")
+                break
         time.sleep(SLEEP_BETWEEN_REQUESTS)
 
     with open(OUTPUT_CSV, "w", newline="") as f:
