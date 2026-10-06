@@ -5,6 +5,7 @@ Trades are grouped by the company the insider works for (the "issuer"), so
 several different insiders trading at one company shows up as a cluster.
 Writes form4_clusters.csv (selling) and form4_buys.csv (buying).
 
+A single CEO, CFO or president buying $50,000 or more also counts.
 Only open-market purchases (transaction code P) count as buying. Stock awards,
 option exercises and gifts are ignored, because they are not a bet on the stock.
 """
@@ -31,6 +32,8 @@ SLEEP_BETWEEN_REQUESTS = 0.35
 MAX_FORM4_TO_CHECK = 2500
 MAX_ERRORS_IN_A_ROW = 5
 MIN_BUYER_DOLLARS = 10_000   # a buyer must spend at least this much to count
+MIN_EXEC_DOLLARS = 50_000    # a CEO, CFO or president buying this much on their own is a signal
+EXEC_TITLE = re.compile(r"\b(?:chief executive|ceo|chief financial|cfo|president|chairman)\b", re.IGNORECASE)
 
 
 def get_with_retry(url, headers, stream=False, timeout=30, tries=3):
@@ -83,6 +86,11 @@ def parse_form4(xml_text: str):
         for el in root.findall("reportingOwner/reportingOwnerId/rptOwnerName")
         if el.text
     ]
+    is_exec = False
+    for owner_el in root.findall("reportingOwner"):
+        title = text_of(owner_el, "reportingOwnerRelationship/officerTitle")
+        if title and EXEC_TITLE.search(title):
+            is_exec = True
 
     sold_shares = 0.0
     saw_sale = False
@@ -111,6 +119,7 @@ def parse_form4(xml_text: str):
         "bought_shares": bought_shares,
         "bought_dollars": bought_dollars,
         "saw_buy": saw_buy,
+        "is_exec": is_exec,
     }
 
 
@@ -168,11 +177,16 @@ def main():
                         "ticker": parsed["issuer_ticker"],
                         "date_filed": row["date_filed"],
                         "buyers": {},
+                        "exec_buyers": {},
                         "shares": 0.0,
                     })
                     group["buyers"][parsed["owner"]] = (
                         group["buyers"].get(parsed["owner"], 0.0) + parsed["bought_dollars"]
                     )
+                    if parsed["is_exec"]:
+                        group["exec_buyers"][parsed["owner"]] = (
+                            group["exec_buyers"].get(parsed["owner"], 0.0) + parsed["bought_dollars"]
+                        )
                     group["shares"] += parsed["bought_shares"]
 
         except requests.RequestException as e:
@@ -204,10 +218,12 @@ def main():
             })
 
     buy_clusters = 0
+    exec_buys = 0
     with open(BUYS_CSV, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=[
             "company", "cik", "ticker", "date_filed", "num_buyers",
-            "total_shares_bought", "total_dollars_bought", "buyers", "buy_cluster_flag"
+            "total_shares_bought", "total_dollars_bought", "buyers", "buy_cluster_flag",
+            "exec_buyer_flag", "exec_buyer_dollars"
         ])
         writer.writeheader()
 
@@ -218,6 +234,10 @@ def main():
             flag = "YES" if len(real_buyers) >= 2 else "no"
             if flag == "YES":
                 buy_clusters += 1
+            exec_best = max(group["exec_buyers"].values(), default=0.0)
+            exec_flag = "YES" if exec_best >= MIN_EXEC_DOLLARS else "no"
+            if exec_flag == "YES":
+                exec_buys += 1
             writer.writerow({
                 "company": group["company"],
                 "cik": cik,
@@ -228,11 +248,13 @@ def main():
                 "total_dollars_bought": int(sum(real_buyers.values())),
                 "buyers": "; ".join(real_buyers.keys()),
                 "buy_cluster_flag": flag,
+                "exec_buyer_flag": exec_flag,
+                "exec_buyer_dollars": int(exec_best),
             })
 
     clusters = sum(1 for g in groups.values() if len(g["sellers"]) >= 2)
     print(f"{len(groups)} compan(ies) with insider sales, {clusters} with 2+ insiders selling.")
-    print(f"{len(buy_groups)} compan(ies) with insider purchases, {buy_clusters} with 2+ insiders buying.")
+    print(f"{len(buy_groups)} compan(ies) with insider purchases, {buy_clusters} with 2+ insiders buying, {exec_buys} with a CEO/CFO/president buying.")
     print(f"Wrote {OUTPUT_CSV} and {BUYS_CSV}")
 
 
