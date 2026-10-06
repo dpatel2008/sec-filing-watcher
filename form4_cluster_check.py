@@ -1,9 +1,12 @@
 """
 form4_cluster_check.py
-Opens every Form 4 from all_filings.csv and looks for insider selling.
-Sales are grouped by the company the insider works for (the "issuer"), so
-several different insiders selling at one company shows up as a cluster.
-Writes form4_clusters.csv.
+Opens every Form 4 from all_filings.csv and looks for insider SELLING and insider BUYING.
+Trades are grouped by the company the insider works for (the "issuer"), so
+several different insiders trading at one company shows up as a cluster.
+Writes form4_clusters.csv (selling) and form4_buys.csv (buying).
+
+Only open-market purchases (transaction code P) count as buying. Stock awards,
+option exercises and gifts are ignored, because they are not a bet on the stock.
 """
 
 import csv
@@ -22,10 +25,12 @@ HEADERS = {
 
 INPUT_CSV = "all_filings.csv"
 OUTPUT_CSV = "form4_clusters.csv"
+BUYS_CSV = "form4_buys.csv"
 
 SLEEP_BETWEEN_REQUESTS = 0.35
 MAX_FORM4_TO_CHECK = 2500
 MAX_ERRORS_IN_A_ROW = 5
+MIN_BUYER_DOLLARS = 10_000   # a buyer must spend at least this much to count
 
 
 def get_with_retry(url, headers, stream=False, timeout=30, tries=3):
@@ -57,6 +62,13 @@ def text_of(node, path: str) -> str:
     return el.text.strip() if el is not None and el.text else ""
 
 
+def to_float(text: str) -> float:
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def parse_form4(xml_text: str):
     try:
         root = ET.fromstring(xml_text.strip())
@@ -74,13 +86,20 @@ def parse_form4(xml_text: str):
 
     sold_shares = 0.0
     saw_sale = False
+    bought_shares = 0.0
+    bought_dollars = 0.0
+    saw_buy = False
     for txn in root.findall(".//nonDerivativeTransaction"):
-        if text_of(txn, "transactionCoding/transactionCode") == "S":
+        code = text_of(txn, "transactionCoding/transactionCode")
+        shares = to_float(text_of(txn, "transactionAmounts/transactionShares/value"))
+        if code == "S":
             saw_sale = True
-            try:
-                sold_shares += float(text_of(txn, "transactionAmounts/transactionShares/value"))
-            except ValueError:
-                pass
+            sold_shares += shares
+        elif code == "P":
+            saw_buy = True
+            price = to_float(text_of(txn, "transactionAmounts/transactionPricePerShare/value"))
+            bought_shares += shares
+            bought_dollars += shares * price
 
     return {
         "issuer_cik": text_of(root, "issuer/issuerCik"),
@@ -89,6 +108,9 @@ def parse_form4(xml_text: str):
         "owner": " & ".join(owners) if owners else "Unknown",
         "sold_shares": sold_shares,
         "saw_sale": saw_sale,
+        "bought_shares": bought_shares,
+        "bought_dollars": bought_dollars,
+        "saw_buy": saw_buy,
     }
 
 
@@ -111,7 +133,8 @@ def main():
     form4_rows = form4_rows[:MAX_FORM4_TO_CHECK]
     print(f"Checking {len(form4_rows)} unique Form 4 filing(s)...")
 
-    groups = {}
+    groups = {}       # companies with insider sales
+    buy_groups = {}   # companies with insider purchases
     errors_in_a_row = 0
 
     for row in form4_rows:
@@ -127,22 +150,30 @@ def main():
                     parsed = result
                     break
 
-            if not parsed or not parsed["saw_sale"]:
-                continue
-
-            cik = normalize_cik(parsed["issuer_cik"])
-            if not cik:
-                continue
-
-            group = groups.setdefault(cik, {
-                "company": parsed["issuer_name"],
-                "ticker": parsed["issuer_ticker"],
-                "date_filed": row["date_filed"],
-                "sellers": {},
-            })
-            group["sellers"][parsed["owner"]] = (
-                group["sellers"].get(parsed["owner"], 0.0) + parsed["sold_shares"]
-            )
+            if parsed:
+                cik = normalize_cik(parsed["issuer_cik"])
+                if cik and parsed["saw_sale"]:
+                    group = groups.setdefault(cik, {
+                        "company": parsed["issuer_name"],
+                        "ticker": parsed["issuer_ticker"],
+                        "date_filed": row["date_filed"],
+                        "sellers": {},
+                    })
+                    group["sellers"][parsed["owner"]] = (
+                        group["sellers"].get(parsed["owner"], 0.0) + parsed["sold_shares"]
+                    )
+                if cik and parsed["saw_buy"]:
+                    group = buy_groups.setdefault(cik, {
+                        "company": parsed["issuer_name"],
+                        "ticker": parsed["issuer_ticker"],
+                        "date_filed": row["date_filed"],
+                        "buyers": {},
+                        "shares": 0.0,
+                    })
+                    group["buyers"][parsed["owner"]] = (
+                        group["buyers"].get(parsed["owner"], 0.0) + parsed["bought_dollars"]
+                    )
+                    group["shares"] += parsed["bought_shares"]
 
         except requests.RequestException as e:
             print(f"  Error fetching {row['url']}: {e}")
@@ -172,9 +203,37 @@ def main():
                 "cluster_flag": "YES" if len(sellers) >= 2 else "no",
             })
 
+    buy_clusters = 0
+    with open(BUYS_CSV, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            "company", "cik", "ticker", "date_filed", "num_buyers",
+            "total_shares_bought", "total_dollars_bought", "buyers", "buy_cluster_flag"
+        ])
+        writer.writeheader()
+
+        for cik, group in buy_groups.items():
+            real_buyers = {name: d for name, d in group["buyers"].items() if d >= MIN_BUYER_DOLLARS}
+            if not real_buyers:
+                continue
+            flag = "YES" if len(real_buyers) >= 2 else "no"
+            if flag == "YES":
+                buy_clusters += 1
+            writer.writerow({
+                "company": group["company"],
+                "cik": cik,
+                "ticker": group["ticker"],
+                "date_filed": group["date_filed"],
+                "num_buyers": len(real_buyers),
+                "total_shares_bought": int(group["shares"]),
+                "total_dollars_bought": int(sum(real_buyers.values())),
+                "buyers": "; ".join(real_buyers.keys()),
+                "buy_cluster_flag": flag,
+            })
+
     clusters = sum(1 for g in groups.values() if len(g["sellers"]) >= 2)
     print(f"{len(groups)} compan(ies) with insider sales, {clusters} with 2+ insiders selling.")
-    print(f"Wrote {OUTPUT_CSV}")
+    print(f"{len(buy_groups)} compan(ies) with insider purchases, {buy_clusters} with 2+ insiders buying.")
+    print(f"Wrote {OUTPUT_CSV} and {BUYS_CSV}")
 
 
 if __name__ == "__main__":
