@@ -1,7 +1,7 @@
 """
 engine.py
-The tracker's brain. Builds the trade plan, places paper trades, manages exits,
-rebalances the hedge, and writes the reports. Works with any broker object that
+The tracker's brain. Builds the trade plan, places paper trades (stock and option
+spreads, long and short), manages exits, rebalances the hedge, and writes the reports. Works with any broker object that
 has the same methods as IBBroker.
 """
 
@@ -27,7 +27,8 @@ PLAN_FIELDS = [
     "stop", "target", "stop_dist", "target_dist", "exit_by", "risk_dollars",
     "opt_expiry", "opt_dte", "opt_atm_strike", "opt_atm_iv", "implied_move_pct",
     "spread_type", "spread_legs", "spread_debit", "spread_max_profit", "spread_breakeven",
-    "spread_delta", "spread_gamma", "spread_vega", "spread_theta", "filing_url",
+    "spread_delta", "spread_gamma", "spread_vega", "spread_theta",
+    "spread_qty", "spread_cost", "spread_status", "filing_url",
 ]
 
 CLOSED_FIELDS = [
@@ -81,6 +82,19 @@ def load_open_trades():
 def save_open_trades(trades):
     with open(data_path("open_trades.json"), "w") as f:
         json.dump(trades, f, indent=2)
+
+
+def load_open_options():
+    try:
+        with open(data_path("open_options.json")) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return []
+
+
+def save_open_options(options):
+    with open(data_path("open_options.json"), "w") as f:
+        json.dump(options, f, indent=2)
 
 
 def load_closed_trades():
@@ -138,19 +152,21 @@ class Session:
 
 # ---------------------------------------------------------------- the trade plan
 
-def build_plan(session, signals, equity, open_symbols, today):
+def build_plan(session, signals, equity, open_symbols, today, open_spread_count=0):
     broker = session.broker
     plan = []
     analyzed = 0
     new_trades = 0
     option_count = 0
+    spreads_planned = 0
+    min_score = min(C.MIN_SCORE_TO_TRADE, C.MIN_SCORE_TO_TRADE_LONG)
     slots = max(0, C.MAX_OPEN_POSITIONS - len(open_symbols))
     max_new = min(slots, C.MAX_NEW_TRADES_PER_RUN)
     bench_closes = None
 
     for sig in signals:
         score = int(float(sig.get("score") or 0))
-        if score < C.MIN_SCORE_TO_TRADE:
+        if score < min_score:
             continue
         symbol = (sig.get("ticker") or "").strip().upper()
         row = {
@@ -179,6 +195,10 @@ def build_plan(session, signals, equity, open_symbols, today):
         direction, tags, why = A.classify_signal(row["forms"], row["reasons"])
         row["direction"] = direction
         row["tags"] = "; ".join(tags)
+        if direction == "SHORT" and score < C.MIN_SCORE_TO_TRADE:
+            continue
+        if direction == "LONG" and score < C.MIN_SCORE_TO_TRADE_LONG:
+            continue
         if direction == "SKIP":
             skip(why)
             continue
@@ -262,11 +282,14 @@ def build_plan(session, signals, equity, open_symbols, today):
             "risk_dollars": round(qty * sized["stop_dist"], 2),
         })
 
+        chain = None
         if option_count < C.OPTION_MAX_CANDIDATES:
             option_count += 1
-            ideas = A.option_ideas(direction, price, broker.option_chain(symbol, price))
+            chain = broker.option_chain(symbol, price)
+            ideas = A.option_ideas(direction, price, chain)
             for key, value in ideas.items():
                 row[key] = round(value, 4) if isinstance(value, float) else value
+            row["_chain"] = chain
 
         row["flags"] = "; ".join(flags)
         if new_trades >= max_new:
@@ -276,13 +299,42 @@ def build_plan(session, signals, equity, open_symbols, today):
             row["decision"] = "TRADE"
             row["decision_reason"] = "passed every check"
             new_trades += 1
+            if plan_spread(row, direction, equity, chain, open_spread_count + spreads_planned):
+                spreads_planned += 1
         plan.append(row)
     return plan
 
 
+def plan_spread(row, direction, equity, chain, spreads_counted):
+    """Decides whether a trade also gets an option spread, and how many. Returns True if planned."""
+    if not C.OPTIONS_ENABLED:
+        row["spread_status"] = "options turned off"
+        return False
+    if spreads_counted >= C.OPTION_MAX_OPEN:
+        row["spread_status"] = "too many spreads open"
+        return False
+    legs = A.spread_legs(direction, chain)
+    if not legs or not row.get("spread_type"):
+        row["spread_status"] = "no usable option prices"
+        return False
+    long_leg, short_leg, _ = legs
+    problem = A.spread_problem(row, long_leg, short_leg)
+    if problem:
+        row["spread_status"] = problem
+        return False
+    count = A.size_spread(equity, row["spread_debit"])
+    if count < 1:
+        row["spread_status"] = "too expensive for the option budget"
+        return False
+    row["spread_qty"] = count
+    row["spread_cost"] = round(count * row["spread_debit"] * 100, 2)
+    row["spread_status"] = "planned"
+    return True
+
+
 # ---------------------------------------------------------------- orders
 
-def execute_plan(broker, plan, open_trades, today):
+def execute_plan(broker, plan, open_trades, open_options, today, events):
     for row in plan:
         if row["decision"] != "TRADE":
             continue
@@ -293,6 +345,7 @@ def execute_plan(broker, plan, open_trades, today):
         if filled < 1:
             row["decision"] = "NOT FILLED"
             row["decision_reason"] = f"order ended as {result.get('status')}"
+            events.append(f"{row['symbol']}: {action} order was not filled ({result.get('status')})")
             continue
         fill = result.get("avg_fill_price") or row["price"]
         sign = -1 if row["direction"] == "SHORT" else 1
@@ -307,8 +360,56 @@ def execute_plan(broker, plan, open_trades, today):
             "target": fill + sign * row["target_dist"],
             "exit_by": row["exit_by"], "beta": row["beta"],
         })
+        save_open_trades(open_trades)
         row["decision"] = "FILLED"
         row["decision_reason"] = f"{action} {filled} at {fill:.2f}"
+        events.append(f"{action} {filled} {row['symbol']} at {fill:.2f} ({row['direction']}, score {row['score']})")
+        if row.get("spread_status") == "planned":
+            execute_spread(broker, row, open_options, today, events)
+
+
+def execute_spread(broker, row, open_options, today, events):
+    symbol = row["symbol"]
+    chain = row.get("_chain")
+    legs = A.spread_legs(row["direction"], chain)
+    if not legs:
+        row["spread_status"] = "option prices disappeared"
+        return
+    long_leg, short_leg, right = legs
+    if not long_leg.get("conId") or not short_leg.get("conId"):
+        row["spread_status"] = "option contracts not found"
+        return
+    opt = {
+        "trade_id": f"{today.isoformat()}-{symbol}-SPREAD",
+        "stock_trade_id": f"{today.isoformat()}-{symbol}",
+        "symbol": symbol, "underlying": chain.get("underlying", symbol),
+        "company": row["company"], "direction": row["direction"],
+        "tags": [t for t in row["tags"].split("; ") if t], "score": row["score"],
+        "right": right, "expiry": chain["expiry"],
+        "long_strike": long_leg["strike"], "short_strike": short_leg["strike"],
+        "long_conid": long_leg["conId"], "short_conid": short_leg["conId"],
+        "multiplier": chain.get("multiplier", "100"), "trading_class": chain.get("trading_class", ""),
+        "entry_date": today.isoformat(),
+    }
+    debit = long_leg["mid"] - short_leg["mid"]
+    limit = debit * (1 + C.OPTION_LIMIT_SLIPPAGE)
+    result = broker.place_spread(opt, "BUY", int(row["spread_qty"]), limit, f"SECW-OPT-{symbol}-{today.isoformat()}")
+    filled = int(result.get("filled") or 0)
+    if filled < 1:
+        row["spread_status"] = f"not filled ({result.get('status')})"
+        events.append(f"{symbol}: option spread was not filled ({result.get('status')})")
+        return
+    fill = result.get("avg_fill_price") or debit
+    width = abs(long_leg["strike"] - short_leg["strike"])
+    opt.update({"qty": filled, "entry_debit": fill, "max_profit": max(width - fill, 0.0)})
+    open_options.append(opt)
+    save_open_options(open_options)
+    row["spread_status"] = f"BOUGHT {filled} at {fill:.2f}"
+    word = "put" if right == "P" else "call"
+    events.append(
+        f"BOUGHT {filled} {symbol} {long_leg['strike']:g}/{short_leg['strike']:g} {word} spread "
+        f"exp {chain['expiry']} at {fill:.2f} (most it can lose: ${fill * 100 * filled:,.0f})"
+    )
 
 
 def manage_exits(session, open_trades, today):
@@ -341,6 +442,41 @@ def manage_exits(session, open_trades, today):
         if filled < int(trade["qty"]):
             trade["qty"] = int(trade["qty"]) - filled
             still_open.append(trade)
+    return still_open, closed_now
+
+
+def manage_option_exits(session, open_options, open_trades, today, events):
+    broker = session.broker
+    open_ids = {t["trade_id"] for t in open_trades}
+    held_ids = {p.get("con_id") for p in broker.positions() if p["sec_type"] == "OPT"}
+    still_open, closed_now = [], []
+    for opt in open_options:
+        quote = broker.spread_quote(opt)
+        mid = quote["mid"] if quote else None
+        label = f"{opt['symbol']} {opt['long_strike']:g}/{opt['short_strike']:g}{opt['right']} spread"
+        if opt["long_conid"] not in held_ids:
+            exit_price = mid if mid is not None else opt["entry_debit"]
+            closed_now.append(A.close_option_record(opt, exit_price, today, "closed outside tracker", opt["qty"]))
+            events.append(f"{label}: no longer in the account, recorded as closed")
+            continue
+        reason = A.option_exit_reason(opt, mid, today, opt["stock_trade_id"] in open_ids)
+        if reason is None:
+            still_open.append(opt)
+            continue
+        limit = mid * (1 - C.OPTION_LIMIT_SLIPPAGE) if mid is not None else 0.01
+        result = broker.place_spread(opt, "SELL", int(opt["qty"]), limit, f"SECW-OPTEXIT-{opt['symbol']}-{today.isoformat()}")
+        filled = int(result.get("filled") or 0)
+        if filled < 1:
+            still_open.append(opt)
+            events.append(f"{label}: wanted to close ({reason}) but the order was not filled")
+            continue
+        exit_price = result.get("avg_fill_price") or mid or 0.0
+        record = A.close_option_record(opt, exit_price, today, reason, filled)
+        closed_now.append(record)
+        events.append(f"Closed {label} ({reason}): P&L ${record['pnl']:,.2f}")
+        if filled < int(opt["qty"]):
+            opt["qty"] = int(opt["qty"]) - filled
+            still_open.append(opt)
     return still_open, closed_now
 
 
@@ -381,11 +517,27 @@ def rebalance_hedge(session, open_trades, today):
 
 # ---------------------------------------------------------------- the report
 
-def build_report(session, account_id, today, open_trades, closed_trades, plan, hedge_info):
+def build_report(session, account_id, today, open_trades, closed_trades, plan, hedge_info, open_options=None, events=None):
     broker = session.broker
     acct = broker.account_values()
     equity = acct.get("NetLiquidation")
     held = {p["symbol"]: p for p in broker.positions() if p["sec_type"] == "STK"}
+
+    option_rows = []
+    for opt in open_options or []:
+        quote = broker.spread_quote(opt)
+        mid = quote["mid"] if quote else None
+        mult = float(opt.get("multiplier") or 100)
+        qty = int(opt["qty"])
+        option_rows.append({
+            "symbol": opt["symbol"], "direction": opt["direction"],
+            "kind": "Bear put spread" if opt["right"] == "P" else "Bull call spread",
+            "legs": f"Buy {opt['long_strike']:g} / Sell {opt['short_strike']:g} {'put' if opt['right'] == 'P' else 'call'}",
+            "expiry": opt["expiry"], "qty": qty, "entry_debit": opt["entry_debit"], "mid": mid,
+            "pnl": (mid - opt["entry_debit"]) * mult * qty if mid is not None else None,
+            "max_loss": opt["entry_debit"] * mult * qty, "max_profit": opt["max_profit"] * mult * qty,
+            "entry_date": opt["entry_date"],
+        })
 
     open_rows, exposures = [], []
     for trade in open_trades:
@@ -464,9 +616,25 @@ def build_report(session, account_id, today, open_trades, closed_trades, plan, h
         "equity_stats": A.equity_stats(numeric_curve),
         "alpha_beta": A.alpha_beta(numeric_curve),
         "trade_stats": A.trade_stats(closed_trades),
-        "tag_stats": A.stats_by_tag(closed_trades),
+        "tag_stats": group_stats(closed_trades),
+        "option_rows": option_rows,
+        "events": events or [],
         "spy_adv": spy_adv,
     }
+
+
+def group_stats(closed_trades):
+    """Results by signal type for stock trades, then by long/short, then all option spreads together."""
+    stock = [t for t in closed_trades if "OPTION_SPREAD" not in t["tags"]]
+    spreads = [t for t in closed_trades if "OPTION_SPREAD" in t["tags"]]
+    stats = A.stats_by_tag(stock)
+    for side in ("LONG", "SHORT"):
+        subset = [t for t in stock if t["direction"] == side]
+        if subset:
+            stats[f"{side} stock trades"] = A.trade_stats(subset)
+    if spreads:
+        stats["Option spreads (all)"] = A.trade_stats(spreads)
+    return stats
 
 
 # ---------------------------------------------------------------- the main entry point
@@ -476,7 +644,8 @@ def print_plan(plan):
     print(f"\nTrade plan: {len(trades)} trade(s), {len(plan) - len(trades)} skipped.")
     for r in plan:
         extra = f" x{r['qty']} @ {r['price']}" if r.get("qty") else ""
-        print(f"  [{r['decision']}] {r['symbol'] or '-'} {r['direction']}{extra} score {r['score']}: {r['decision_reason']}")
+        spread = f" | spread: {r['spread_status']}" if r.get("spread_status") else ""
+        print(f"  [{r['decision']}] {r['symbol'] or '-'} {r['direction']}{extra} score {r['score']}: {r['decision_reason']}{spread}")
 
 
 def run(mode, broker, signals_path=None, force=False, today=None):
@@ -496,15 +665,21 @@ def run(mode, broker, signals_path=None, force=False, today=None):
     print(f"Account {account}, net liquidation ${equity:,.0f}")
 
     open_trades = load_open_trades()
+    open_options = load_open_options()
     closed_trades = load_closed_trades()
     hedge_info = None
+    events = []
 
     if mode == "trade":
         open_trades, closed_now = manage_exits(session, open_trades, today)
-        closed_trades += closed_now
         for c in closed_now:
-            print(f"  Closed {c['symbol']} ({c['exit_reason']}): P&L ${c['pnl']:,.2f}")
+            events.append(f"Closed {c['symbol']} ({c['exit_reason']}): P&L ${c['pnl']:,.2f}")
+        open_options, closed_options = manage_option_exits(session, open_options, open_trades, today, events)
+        closed_trades += closed_now + closed_options
+        for line in events:
+            print(f"  {line}")
         save_open_trades(open_trades)
+        save_open_options(open_options)
         save_closed_trades(closed_trades)
 
     plan_file = data_path(f"trade_plan_{today.isoformat()}.csv")
@@ -513,20 +688,23 @@ def run(mode, broker, signals_path=None, force=False, today=None):
     else:
         signals = load_signals(signals_path)
         print(f"Loaded {len(signals)} ranked signal(s).")
-        plan = build_plan(session, signals, equity, {t["symbol"] for t in open_trades}, today)
+        plan = build_plan(session, signals, equity, {t["symbol"] for t in open_trades}, today, len(open_options))
 
     if mode == "trade":
-        execute_plan(broker, plan, open_trades, today)
+        execute_plan(broker, plan, open_trades, open_options, today, events)
         save_open_trades(open_trades)
+        save_open_options(open_options)
         hedge_info = rebalance_hedge(session, open_trades, today)
         if hedge_info:
             print(f"Hedge: {hedge_info['status']}")
+            if hedge_info["status"] != "already balanced":
+                events.append(f"Hedge: {hedge_info['status']}")
 
     if mode != "report":
         write_csv(plan_file, plan, PLAN_FIELDS)
         print_plan(plan)
 
-    report = build_report(session, account, today, open_trades, closed_trades, plan, hedge_info)
+    report = build_report(session, account, today, open_trades, closed_trades, plan, hedge_info, open_options, events)
     if report["spy_adv"] is not None:
         print(f"Volume check: {C.BENCHMARK_SYMBOL} average daily dollar volume is ${report['spy_adv']:,.0f} "
               f"(should be in the tens of billions; if it looks 100 times too small or big, change HISTORY_VOLUME_MULTIPLIER).")
