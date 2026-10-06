@@ -11,6 +11,7 @@ import numpy as np
 import config as C
 
 BEARISH = ("DILUTION", "GOING_CONCERN", "INSIDER_SELLING", "LATE_FILING")
+BULLISH = ("INSIDER_BUYING", "POSITIVE_8K")
 
 
 def is_num(x):
@@ -54,6 +55,10 @@ def signal_tags(form_types, reasons):
         tags.append("GOING_CONCERN")
     if "insiders sold" in reasons_l:
         tags.append("INSIDER_SELLING")
+    if "insiders bought" in reasons_l:
+        tags.append("INSIDER_BUYING")
+    if "positive 8-k" in reasons_l:
+        tags.append("POSITIVE_8K")
     if any(f in ("NT 10-Q", "NT 10-K") for f in forms):
         tags.append("LATE_FILING")
     if any(f in ("SC 13D", "SCHEDULE 13D") for f in forms):
@@ -67,10 +72,17 @@ def classify_signal(form_types, reasons):
     """Returns (direction, tags, why_skipped). Direction is SHORT, LONG or SKIP."""
     tags = signal_tags(form_types, reasons)
     bearish = [t for t in tags if t in BEARISH]
+    bullish = [t for t in tags if t in BULLISH]
+    if bearish and bullish:
+        return "SKIP", tags, "conflicting signals (bearish and bullish at the same time)"
     if bearish and "ACTIVIST_13D" in tags:
         return "SKIP", tags, "conflicting signals (bearish filing plus a 13D)"
     if bearish:
         return "SHORT", tags, ""
+    if bullish:
+        if C.TRADE_LONGS:
+            return "LONG", tags, ""
+        return "SKIP", tags, "long trades are turned off"
     if "ACTIVIST_13D" in tags:
         if C.TRADE_13D_LONGS:
             return "LONG", tags, ""
@@ -206,7 +218,21 @@ def close_record(trade, exit_price, exit_date, reason, qty):
     }
 
 
-# ---------------------------------------------------------------- options ideas
+# ---------------------------------------------------------------- option spreads
+
+def spread_legs(direction, chain):
+    """Returns (long_leg, short_leg, right) for the spread that fits the direction, or None.
+    SHORT ideas use a bear put spread, LONG ideas use a bull call spread."""
+    if not chain:
+        return None
+    if direction == "SHORT":
+        long_leg, short_leg, right = chain.get("atm_put"), chain.get("otm_put"), "P"
+    else:
+        long_leg, short_leg, right = chain.get("atm_call"), chain.get("otm_call"), "C"
+    if long_leg and short_leg and is_num(long_leg.get("mid")) and is_num(short_leg.get("mid")):
+        return long_leg, short_leg, right
+    return None
+
 
 def option_ideas(direction, price, chain):
     """chain has atm_call, atm_put, otm_call, otm_put quotes (or None) plus expiry and dte."""
@@ -224,14 +250,10 @@ def option_ideas(direction, price, chain):
     if ivs:
         out["opt_atm_iv"] = sum(ivs) / len(ivs)
 
-    if direction == "SHORT":
-        name, right = "Bear put spread", "P"
-        long_leg, short_leg = put, chain.get("otm_put")
-    else:
-        name, right = "Bull call spread", "C"
-        long_leg, short_leg = call, chain.get("otm_call")
-
-    if long_leg and short_leg and is_num(long_leg.get("mid")) and is_num(short_leg.get("mid")):
+    legs = spread_legs(direction, chain)
+    if legs:
+        long_leg, short_leg, right = legs
+        name = "Bear put spread" if right == "P" else "Bull call spread"
         debit = long_leg["mid"] - short_leg["mid"]
         width = abs(long_leg["strike"] - short_leg["strike"])
         if debit > 0 and width > debit:
@@ -250,6 +272,72 @@ def option_ideas(direction, price, chain):
                 if is_num(a) and is_num(b):
                     out["spread_" + greek] = a - b
     return out
+
+
+def spread_problem(ideas, long_leg, short_leg):
+    """Returns None when the spread is fine to trade, otherwise a short reason it was skipped."""
+    debit, max_profit = ideas.get("spread_debit"), ideas.get("spread_max_profit")
+    if not (is_num(debit) and is_num(max_profit)):
+        return "no usable spread prices"
+    if debit < C.OPTION_MIN_DEBIT:
+        return f"spread costs under ${C.OPTION_MIN_DEBIT:.2f} a share"
+    if max_profit / debit < C.OPTION_MIN_REWARD_RISK:
+        return "best case is smaller than the cost"
+    for leg in (long_leg, short_leg):
+        bid, ask, mid = leg.get("bid"), leg.get("ask"), leg.get("mid")
+        if is_num(bid) and is_num(ask) and is_num(mid) and bid > 0 and ask > 0 and mid > 0:
+            if (ask - bid) / mid > C.OPTION_MAX_LEG_GAP_PCT:
+                return "option prices are too wide (bid and ask far apart)"
+    return None
+
+
+def size_spread(equity, debit):
+    """How many spreads to buy so the most we can lose is OPTION_RISK_PCT of the account."""
+    per_spread = debit * 100.0
+    if not (is_num(per_spread) and per_spread > 0):
+        return 0
+    count = int(math.floor(equity * C.OPTION_RISK_PCT / per_spread))
+    return max(0, min(count, C.OPTION_MAX_CONTRACTS))
+
+
+def option_exit_reason(opt, mid, today, underlying_open):
+    """opt is an open spread record. mid is the spread's current value per share, or None."""
+    expiry = parse_date(opt.get("expiry", ""))
+    if expiry and (expiry - today).days <= C.OPTION_CLOSE_DTE:
+        return "near expiry"
+    if not underlying_open:
+        return "stock trade closed"
+    if is_num(mid):
+        if mid - opt["entry_debit"] >= C.OPTION_TAKE_PROFIT_PCT * opt["max_profit"]:
+            return "profit target"
+        if mid <= opt["entry_debit"] * (1 - C.OPTION_STOP_LOSS_PCT):
+            return "stop loss"
+    return None
+
+
+def close_option_record(opt, exit_price, exit_date, reason, qty):
+    mult = float(opt.get("multiplier") or 100)
+    pnl = (exit_price - opt["entry_debit"]) * mult * qty
+    cost = opt["entry_debit"] * mult * qty
+    entry = parse_date(opt["entry_date"])
+    word = "put" if opt["right"] == "P" else "call"
+    return {
+        "trade_id": opt["trade_id"],
+        "symbol": f"{opt['symbol']} {word} spread",
+        "company": opt["company"],
+        "direction": f"{opt['direction']} SPREAD",
+        "tags": list(opt["tags"]) + ["OPTION_SPREAD"],
+        "score": opt["score"],
+        "qty": qty,
+        "entry_date": opt["entry_date"],
+        "entry_price": opt["entry_debit"],
+        "exit_date": exit_date.isoformat(),
+        "exit_price": exit_price,
+        "exit_reason": reason,
+        "pnl": pnl,
+        "return_pct": pnl / cost if cost else 0.0,
+        "hold_days": (exit_date - entry).days if entry else 0,
+    }
 
 
 # ---------------------------------------------------------------- risk
