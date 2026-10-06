@@ -26,7 +26,7 @@ PLAN_FIELDS = [
     "shortable_level", "shortable_shares", "put_call_volume", "qty", "notional", "pct_of_equity",
     "stop", "target", "stop_dist", "target_dist", "exit_by", "risk_dollars",
     "opt_expiry", "opt_dte", "opt_atm_strike", "opt_atm_iv", "implied_move_pct",
-    "spread_type", "spread_legs", "spread_debit", "spread_max_profit", "spread_breakeven",
+    "opt_style", "spread_type", "spread_legs", "spread_debit", "spread_max_profit", "spread_breakeven",
     "spread_delta", "spread_gamma", "spread_vega", "spread_theta",
     "spread_qty", "spread_cost", "spread_status", "filing_url",
 ]
@@ -157,6 +157,8 @@ def build_plan(session, signals, equity, open_symbols, today, open_spread_count=
     plan = []
     analyzed = 0
     new_trades = 0
+    new_by_side = {"LONG": 0, "SHORT": 0}
+    side_caps = {"LONG": C.MAX_NEW_LONGS_PER_RUN, "SHORT": C.MAX_NEW_SHORTS_PER_RUN}
     option_count = 0
     spreads_planned = 0
     min_score = min(C.MIN_SCORE_TO_TRADE, C.MIN_SCORE_TO_TRADE_LONG)
@@ -282,23 +284,30 @@ def build_plan(session, signals, equity, open_symbols, today, open_spread_count=
             "risk_dollars": round(qty * sized["stop_dist"], 2),
         })
 
+        if new_trades >= max_new:
+            decision, why_not = "SKIP", "position or new-trade limit reached"
+        elif new_by_side[direction] >= side_caps[direction]:
+            decision, why_not = "SKIP", f"all {direction.lower()} slots for this run are used"
+        else:
+            decision, why_not = "TRADE", "passed every check"
+
+        style = A.option_style(score)
+        row["opt_style"] = style
         chain = None
-        if option_count < C.OPTION_MAX_CANDIDATES:
+        if decision == "TRADE" or option_count < C.OPTION_MAX_CANDIDATES:
             option_count += 1
             chain = broker.option_chain(symbol, price)
-            ideas = A.option_ideas(direction, price, chain)
+            ideas = A.option_ideas(direction, price, chain, style)
             for key, value in ideas.items():
                 row[key] = round(value, 4) if isinstance(value, float) else value
             row["_chain"] = chain
 
         row["flags"] = "; ".join(flags)
-        if new_trades >= max_new:
-            row["decision"] = "SKIP"
-            row["decision_reason"] = "position or new-trade limit reached"
-        else:
-            row["decision"] = "TRADE"
-            row["decision_reason"] = "passed every check"
+        row["decision"] = decision
+        row["decision_reason"] = why_not
+        if decision == "TRADE":
             new_trades += 1
+            new_by_side[direction] += 1
             if plan_spread(row, direction, equity, chain, open_spread_count + spreads_planned):
                 spreads_planned += 1
         plan.append(row)
@@ -306,14 +315,16 @@ def build_plan(session, signals, equity, open_symbols, today, open_spread_count=
 
 
 def plan_spread(row, direction, equity, chain, spreads_counted):
-    """Decides whether a trade also gets an option spread, and how many. Returns True if planned."""
+    """Decides whether a trade also gets an option (a spread or a plain call/put), and how many.
+    Returns True if planned."""
     if not C.OPTIONS_ENABLED:
         row["spread_status"] = "options turned off"
         return False
     if spreads_counted >= C.OPTION_MAX_OPEN:
-        row["spread_status"] = "too many spreads open"
+        row["spread_status"] = "too many options open"
         return False
-    legs = A.spread_legs(direction, chain)
+    style = row.get("opt_style", "spread")
+    legs = A.option_legs(direction, chain, style)
     if not legs or not row.get("spread_type"):
         row["spread_status"] = "no usable option prices"
         return False
@@ -371,44 +382,56 @@ def execute_plan(broker, plan, open_trades, open_options, today, events):
 def execute_spread(broker, row, open_options, today, events):
     symbol = row["symbol"]
     chain = row.get("_chain")
-    legs = A.spread_legs(row["direction"], chain)
+    style = row.get("opt_style", "spread")
+    legs = A.option_legs(row["direction"], chain, style)
     if not legs:
         row["spread_status"] = "option prices disappeared"
         return
     long_leg, short_leg, right = legs
-    if not long_leg.get("conId") or not short_leg.get("conId"):
+    if not long_leg.get("conId") or (short_leg is not None and not short_leg.get("conId")):
         row["spread_status"] = "option contracts not found"
         return
     opt = {
-        "trade_id": f"{today.isoformat()}-{symbol}-SPREAD",
+        "trade_id": f"{today.isoformat()}-{symbol}-OPTION",
         "stock_trade_id": f"{today.isoformat()}-{symbol}",
+        "style": style,
         "symbol": symbol, "underlying": chain.get("underlying", symbol),
         "company": row["company"], "direction": row["direction"],
         "tags": [t for t in row["tags"].split("; ") if t], "score": row["score"],
         "right": right, "expiry": chain["expiry"],
-        "long_strike": long_leg["strike"], "short_strike": short_leg["strike"],
-        "long_conid": long_leg["conId"], "short_conid": short_leg["conId"],
+        "long_strike": long_leg["strike"],
+        "short_strike": short_leg["strike"] if short_leg else None,
+        "long_conid": long_leg["conId"],
+        "short_conid": short_leg["conId"] if short_leg else None,
         "multiplier": chain.get("multiplier", "100"), "trading_class": chain.get("trading_class", ""),
         "entry_date": today.isoformat(),
     }
-    debit = long_leg["mid"] - short_leg["mid"]
+    debit = long_leg["mid"] - (short_leg["mid"] if short_leg else 0.0)
     limit = debit * (1 + C.OPTION_LIMIT_SLIPPAGE)
     result = broker.place_spread(opt, "BUY", int(row["spread_qty"]), limit, f"SECW-OPT-{symbol}-{today.isoformat()}")
     filled = int(result.get("filled") or 0)
     if filled < 1:
         row["spread_status"] = f"not filled ({result.get('status')})"
-        events.append(f"{symbol}: option spread was not filled ({result.get('status')})")
+        events.append(f"{symbol}: option order was not filled ({result.get('status')})")
         return
     fill = result.get("avg_fill_price") or debit
-    width = abs(long_leg["strike"] - short_leg["strike"])
-    opt.update({"qty": filled, "entry_debit": fill, "max_profit": max(width - fill, 0.0)})
+    if short_leg is not None:
+        width = abs(long_leg["strike"] - short_leg["strike"])
+        max_profit = max(width - fill, 0.0)
+    else:
+        max_profit = None
+    opt.update({"qty": filled, "entry_debit": fill, "max_profit": max_profit})
     open_options.append(opt)
     save_open_options(open_options)
     row["spread_status"] = f"BOUGHT {filled} at {fill:.2f}"
     word = "put" if right == "P" else "call"
+    if short_leg is None:
+        what = f"{long_leg['strike']:g} long {word}"
+    else:
+        what = f"{long_leg['strike']:g}/{short_leg['strike']:g} {word} spread"
     events.append(
-        f"BOUGHT {filled} {symbol} {long_leg['strike']:g}/{short_leg['strike']:g} {word} spread "
-        f"exp {chain['expiry']} at {fill:.2f} (most it can lose: ${fill * 100 * filled:,.0f})"
+        f"BOUGHT {filled} {symbol} {what} exp {chain['expiry']} at {fill:.2f} "
+        f"(most it can lose: ${fill * 100 * filled:,.0f})"
     )
 
 
@@ -453,7 +476,10 @@ def manage_option_exits(session, open_options, open_trades, today, events):
     for opt in open_options:
         quote = broker.spread_quote(opt)
         mid = quote["mid"] if quote else None
-        label = f"{opt['symbol']} {opt['long_strike']:g}/{opt['short_strike']:g}{opt['right']} spread"
+        if opt.get("short_conid"):
+            label = f"{opt['symbol']} {opt['long_strike']:g}/{opt['short_strike']:g}{opt['right']} spread"
+        else:
+            label = f"{opt['symbol']} {opt['long_strike']:g}{opt['right']} option"
         if opt["long_conid"] not in held_ids:
             exit_price = mid if mid is not None else opt["entry_debit"]
             closed_now.append(A.close_option_record(opt, exit_price, today, "closed outside tracker", opt["qty"]))
@@ -529,13 +555,22 @@ def build_report(session, account_id, today, open_trades, closed_trades, plan, h
         mid = quote["mid"] if quote else None
         mult = float(opt.get("multiplier") or 100)
         qty = int(opt["qty"])
+        single = not opt.get("short_conid")
+        word = "put" if opt["right"] == "P" else "call"
+        if single:
+            kind = "Long put" if opt["right"] == "P" else "Long call"
+            legs_text = f"Buy {opt['long_strike']:g} {word}"
+        else:
+            kind = "Bear put spread" if opt["right"] == "P" else "Bull call spread"
+            legs_text = f"Buy {opt['long_strike']:g} / Sell {opt['short_strike']:g} {word}"
+        max_profit = opt.get("max_profit")
         option_rows.append({
             "symbol": opt["symbol"], "direction": opt["direction"],
-            "kind": "Bear put spread" if opt["right"] == "P" else "Bull call spread",
-            "legs": f"Buy {opt['long_strike']:g} / Sell {opt['short_strike']:g} {'put' if opt['right'] == 'P' else 'call'}",
+            "kind": kind, "legs": legs_text,
             "expiry": opt["expiry"], "qty": qty, "entry_debit": opt["entry_debit"], "mid": mid,
             "pnl": (mid - opt["entry_debit"]) * mult * qty if mid is not None else None,
-            "max_loss": opt["entry_debit"] * mult * qty, "max_profit": opt["max_profit"] * mult * qty,
+            "max_loss": opt["entry_debit"] * mult * qty,
+            "max_profit": max_profit * mult * qty if max_profit is not None else None,
             "entry_date": opt["entry_date"],
         })
 
@@ -624,9 +659,13 @@ def build_report(session, account_id, today, open_trades, closed_trades, plan, h
 
 
 def group_stats(closed_trades):
-    """Results by signal type for stock trades, then by long/short, then all option spreads together."""
-    stock = [t for t in closed_trades if "OPTION_SPREAD" not in t["tags"]]
+    """Results by signal type for stock trades, then by long/short, then the option trades."""
+    def is_option(t):
+        return "OPTION_SPREAD" in t["tags"] or "OPTION_SINGLE" in t["tags"]
+
+    stock = [t for t in closed_trades if not is_option(t)]
     spreads = [t for t in closed_trades if "OPTION_SPREAD" in t["tags"]]
+    singles = [t for t in closed_trades if "OPTION_SINGLE" in t["tags"]]
     stats = A.stats_by_tag(stock)
     for side in ("LONG", "SHORT"):
         subset = [t for t in stock if t["direction"] == side]
@@ -634,6 +673,8 @@ def group_stats(closed_trades):
             stats[f"{side} stock trades"] = A.trade_stats(subset)
     if spreads:
         stats["Option spreads (all)"] = A.trade_stats(spreads)
+    if singles:
+        stats["Single calls and puts (all)"] = A.trade_stats(singles)
     return stats
 
 
@@ -644,7 +685,7 @@ def print_plan(plan):
     print(f"\nTrade plan: {len(trades)} trade(s), {len(plan) - len(trades)} skipped.")
     for r in plan:
         extra = f" x{r['qty']} @ {r['price']}" if r.get("qty") else ""
-        spread = f" | spread: {r['spread_status']}" if r.get("spread_status") else ""
+        spread = f" | option: {r['spread_status']}" if r.get("spread_status") else ""
         print(f"  [{r['decision']}] {r['symbol'] or '-'} {r['direction']}{extra} score {r['score']}: {r['decision_reason']}{spread}")
 
 
