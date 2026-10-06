@@ -245,9 +245,10 @@ class IBBroker:
         return out
 
     def spread_quote(self, opt):
-        """Current value of an open spread: {"mid", "bid", "ask"} per share, or None if no prices."""
+        """Current value of an open spread or single option: {"mid", "bid", "ask"} per share, or None if no prices."""
         contracts = {}
-        for key in ("long_conid", "short_conid"):
+        keys = ["long_conid"] + (["short_conid"] if opt.get("short_conid") else [])
+        for key in keys:
             contract = Contract(conId=int(opt[key]), exchange="SMART")
             try:
                 self.ib.qualifyContracts(contract)
@@ -268,7 +269,12 @@ class IBBroker:
             }
         for contract in contracts.values():
             self.ib.cancelMktData(contract)
-        long_leg, short_leg = legs["long_conid"], legs["short_conid"]
+        long_leg = legs["long_conid"]
+        if "short_conid" not in legs:
+            if long_leg["mid"] is None:
+                return None
+            return {"mid": long_leg["mid"], "bid": long_leg["bid"], "ask": long_leg["ask"]}
+        short_leg = legs["short_conid"]
         if long_leg["mid"] is None or short_leg["mid"] is None:
             return None
         bid = ask = None
@@ -306,7 +312,16 @@ class IBBroker:
 
     def place_spread(self, opt, action, qty, limit, ref):
         """BUY opens the spread (buy the near leg, sell the far leg). SELL closes it.
-        The limit is the price per share of the whole spread."""
+        The limit is the price per share of the whole spread. A single option (no short leg) is
+        bought or sold on its own."""
+        if not opt.get("short_conid"):
+            contract = Contract(
+                conId=int(opt["long_conid"]), secType="OPT", exchange="SMART", currency="USD"
+            )
+            order = LimitOrder(action, qty, round(max(limit, 0.01), 2))
+            order.orderRef = ref
+            order.tif = "DAY"
+            return self._wait_for(self.ib.placeOrder(contract, order), order)
         legs = [
             ComboLeg(conId=int(opt["long_conid"]), ratio=1, action="BUY", exchange="SMART"),
             ComboLeg(conId=int(opt["short_conid"]), ratio=1, action="SELL", exchange="SMART"),
