@@ -1,7 +1,8 @@
 """
 scoring_engine.py
-Combines filing types, insider-selling clusters, insider-buying clusters,
-going-concern language, good-news 8-Ks and (optionally) market data into one
+Combines filing types, insider-selling clusters, insider-buying clusters (and
+CEO/CFO buys), going-concern language, good-news and bad-news 8-Ks and
+(optionally) market data into one
 ranked list of the day's most significant companies. Only companies with a
 score above zero are kept.
 Writes daily_signals_ranked.csv.
@@ -17,6 +18,7 @@ FORM4_CLUSTERS_CSV = "form4_clusters.csv"
 GOING_CONCERN_CSV = "going_concern_flags.csv"
 FORM4_BUYS_CSV = "form4_buys.csv"
 POSITIVE_8K_CSV = "positive_8k_flags.csv"
+NEGATIVE_8K_CSV = "negative_8k_flags.csv"
 MARKET_CONTEXT_CSV = "market_context.csv"
 OUTPUT_CSV = "daily_signals_ranked.csv"
 
@@ -30,6 +32,15 @@ FORM_TYPE_POINTS = {
     "NT 10-Q": 30,
     "NT 10-K": 30,
 }
+
+NEGATIVE_8K_POINTS = {
+    "restatement": 35,
+    "bankruptcy": 40,
+    "delisting notice": 30,
+    "auditor change": 15,
+    "executive departure": 20,
+}
+EXEC_BUY_POINTS = 30
 
 
 def normalize_cik(raw) -> str:
@@ -63,6 +74,7 @@ def main():
     going_concern = load_csv(GOING_CONCERN_CSV)
     form4_buys = load_csv(FORM4_BUYS_CSV)
     positive_8k = load_csv(POSITIVE_8K_CSV)
+    negative_8k = load_csv(NEGATIVE_8K_CSV)
     market_context = load_csv(MARKET_CONTEXT_CSV) if use_market else []
 
     if not filings:
@@ -74,12 +86,17 @@ def main():
     }
     going_concern_by_cik = {normalize_cik(r["cik"]): r for r in going_concern}
     buys_by_cik = {
-        normalize_cik(r["cik"]): r for r in form4_buys if r.get("buy_cluster_flag") == "YES"
+        normalize_cik(r["cik"]): r for r in form4_buys
+        if r.get("buy_cluster_flag") == "YES" or r.get("exec_buyer_flag") == "YES"
     }
     good_news_by_cik = {}
     for r in positive_8k:
         cats = [c.strip() for c in (r.get("categories") or "").split(";") if c.strip()]
         good_news_by_cik.setdefault(normalize_cik(r["cik"]), set()).update(cats)
+    bad_news_by_cik = {}
+    for r in negative_8k:
+        cats = [c.strip() for c in (r.get("categories") or "").split(";") if c.strip()]
+        bad_news_by_cik.setdefault(normalize_cik(r["cik"]), set()).update(cats)
     market_by_ticker = {r["ticker"]: r for r in market_context if r.get("ticker")}
 
     companies = {}
@@ -127,17 +144,34 @@ def main():
         if buy:
             num_buyers = int(safe_float(buy.get("num_buyers", 0)))
             dollars = safe_float(buy.get("total_dollars_bought"))
-            points = min(35 + max(0, num_buyers - 2) * 5, 50)
-            score += points
-            reasons.append(
-                f"{num_buyers} insiders bought stock on the open market, about ${dollars:,.0f} (+{points})"
-            )
+            exec_dollars = safe_float(buy.get("exec_buyer_dollars"))
+            is_exec = buy.get("exec_buyer_flag") == "YES"
+            if buy.get("buy_cluster_flag") == "YES":
+                points = min(35 + max(0, num_buyers - 2) * 5, 50)
+                score += points
+                reasons.append(
+                    f"{num_buyers} insiders bought stock on the open market, about ${dollars:,.0f} (+{points})"
+                )
+                if is_exec:
+                    score += 10
+                    reasons.append(f"A CEO, CFO or president was one of the buyers, about ${exec_dollars:,.0f} (+10)")
+            else:
+                score += EXEC_BUY_POINTS
+                reasons.append(
+                    f"Executive bought stock (CEO/CFO/president), about ${exec_dollars:,.0f} (+{EXEC_BUY_POINTS})"
+                )
 
         good_news = good_news_by_cik.get(cik)
         if good_news:
             points = min(25 * len(good_news), 40)
             score += points
             reasons.append(f"Positive 8-K news: {', '.join(sorted(good_news))} (+{points})")
+
+        bad_news = bad_news_by_cik.get(cik)
+        if bad_news:
+            points = min(sum(NEGATIVE_8K_POINTS.get(c, 10) for c in bad_news), 45)
+            score += points
+            reasons.append(f"Negative 8-K news: {', '.join(sorted(bad_news))} (+{points})")
 
         bullish = bool(buy or good_news)
 
