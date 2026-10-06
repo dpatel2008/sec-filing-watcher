@@ -8,7 +8,7 @@ import math
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from ib_async import IB, MarketOrder, Option, Stock
+from ib_async import ComboLeg, Contract, IB, LimitOrder, MarketOrder, Option, Stock
 
 import config as C
 
@@ -84,6 +84,7 @@ class IBBroker:
             out.append({
                 "symbol": contract.symbol.replace(" ", "-"),
                 "sec_type": contract.secType,
+                "con_id": contract.conId,
                 "qty": float(item.position),
                 "avg_cost": float(item.averageCost),
                 "market_price": _num(item.marketPrice),
@@ -209,7 +210,10 @@ class IBBroker:
                 tickers[name] = self.ib.reqMktData(option, "", False, False)
         self.ib.sleep(4)
 
-        out = {"expiry": expiry, "dte": dte}
+        out = {
+            "expiry": expiry, "dte": dte, "underlying": contract.symbol,
+            "multiplier": chain.multiplier or "100", "trading_class": chain.tradingClass,
+        }
         for name in wanted:
             quote = None
             ticker = tickers.get(name)
@@ -224,6 +228,10 @@ class IBBroker:
                 if mid is not None:
                     quote = {
                         "strike": wanted[name][0],
+                        "right": wanted[name][1],
+                        "conId": options[name].conId,
+                        "bid": _positive(ticker.bid),
+                        "ask": _positive(ticker.ask),
                         "mid": mid,
                         "iv": _num(greeks.impliedVol) if greeks else None,
                         "delta": _num(greeks.delta) if greeks else None,
@@ -236,16 +244,42 @@ class IBBroker:
             self.ib.cancelMktData(options[name])
         return out
 
+    def spread_quote(self, opt):
+        """Current value of an open spread: {"mid", "bid", "ask"} per share, or None if no prices."""
+        contracts = {}
+        for key in ("long_conid", "short_conid"):
+            contract = Contract(conId=int(opt[key]), exchange="SMART")
+            try:
+                self.ib.qualifyContracts(contract)
+            except Exception:
+                return None
+            contracts[key] = contract
+        tickers = {key: self.ib.reqMktData(c, "", False, False) for key, c in contracts.items()}
+        self.ib.sleep(4)
+        legs = {}
+        for key, ticker in tickers.items():
+            greeks = ticker.modelGreeks
+            legs[key] = {
+                "bid": _positive(ticker.bid),
+                "ask": _positive(ticker.ask),
+                "mid": _positive(
+                    ticker.midpoint(), greeks.optPrice if greeks else None, ticker.last, ticker.close
+                ),
+            }
+        for contract in contracts.values():
+            self.ib.cancelMktData(contract)
+        long_leg, short_leg = legs["long_conid"], legs["short_conid"]
+        if long_leg["mid"] is None or short_leg["mid"] is None:
+            return None
+        bid = ask = None
+        if all(x is not None for x in (long_leg["bid"], long_leg["ask"], short_leg["bid"], short_leg["ask"])):
+            bid = long_leg["bid"] - short_leg["ask"]
+            ask = long_leg["ask"] - short_leg["bid"]
+        return {"mid": long_leg["mid"] - short_leg["mid"], "bid": bid, "ask": ask}
+
     # ------------------------------------------------------------ orders
 
-    def place_market(self, symbol, action, qty, ref):
-        contract = self._stock(symbol)
-        if contract is None:
-            return {"status": "no contract", "filled": 0, "avg_fill_price": None}
-        order = MarketOrder(action, qty)
-        order.orderRef = ref
-        order.tif = "DAY"
-        trade = self.ib.placeOrder(contract, order)
+    def _wait_for(self, trade, order):
         waited = 0
         while not trade.isDone() and waited < C.ORDER_WAIT_SECONDS:
             self.ib.sleep(1)
@@ -259,3 +293,29 @@ class IBBroker:
             "filled": int(status.filled),
             "avg_fill_price": _positive(status.avgFillPrice),
         }
+
+    def place_market(self, symbol, action, qty, ref):
+        contract = self._stock(symbol)
+        if contract is None:
+            return {"status": "no contract", "filled": 0, "avg_fill_price": None}
+        order = MarketOrder(action, qty)
+        order.orderRef = ref
+        order.tif = "DAY"
+        trade = self.ib.placeOrder(contract, order)
+        return self._wait_for(trade, order)
+
+    def place_spread(self, opt, action, qty, limit, ref):
+        """BUY opens the spread (buy the near leg, sell the far leg). SELL closes it.
+        The limit is the price per share of the whole spread."""
+        legs = [
+            ComboLeg(conId=int(opt["long_conid"]), ratio=1, action="BUY", exchange="SMART"),
+            ComboLeg(conId=int(opt["short_conid"]), ratio=1, action="SELL", exchange="SMART"),
+        ]
+        combo = Contract(
+            symbol=opt["underlying"], secType="BAG", currency="USD", exchange="SMART", comboLegs=legs
+        )
+        order = LimitOrder(action, qty, round(max(limit, 0.01), 2))
+        order.orderRef = ref
+        order.tif = "DAY"
+        trade = self.ib.placeOrder(combo, order)
+        return self._wait_for(trade, order)
