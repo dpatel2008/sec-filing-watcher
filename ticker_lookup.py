@@ -6,6 +6,7 @@ Writes all_filings_with_tickers.csv (same rows as all_filings.csv plus a
 """
 
 import csv
+import time
 import requests
 
 USER_AGENT = "Dillen Patel dillenpatel2008@gmail.com"
@@ -22,13 +23,28 @@ OUTPUT_CSV = "all_filings_with_tickers.csv"
 SEC_TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
 
 
+def get_with_retry(url, headers, stream=False, timeout=30, tries=5):
+    """Gets a page from the SEC. If the SEC says "slow down" (429 or 503), waits and tries again."""
+    resp = None
+    for attempt in range(1, tries + 1):
+        resp = requests.get(url, headers=headers, stream=stream, timeout=timeout)
+        if resp.status_code in (429, 503) and attempt < tries:
+            wait = 30 * attempt
+            print(f"  The SEC asked us to slow down ({resp.status_code}). Waiting {wait} seconds...")
+            resp.close()
+            time.sleep(wait)
+            continue
+        return resp
+    return resp
+
+
 def normalize_cik(raw) -> str:
     digits = "".join(ch for ch in str(raw) if ch.isdigit())
     return digits.zfill(10) if digits else ""
 
 
 def load_cik_to_ticker_map():
-    resp = requests.get(SEC_TICKER_MAP_URL, headers=HEADERS, timeout=30)
+    resp = get_with_retry(SEC_TICKER_MAP_URL, HEADERS)
     resp.raise_for_status()
     data = resp.json()
 
