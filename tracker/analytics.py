@@ -10,7 +10,7 @@ import numpy as np
 
 import config as C
 
-BEARISH = ("DILUTION", "GOING_CONCERN", "INSIDER_SELLING", "LATE_FILING")
+BEARISH = ("DILUTION", "GOING_CONCERN", "INSIDER_SELLING", "LATE_FILING", "NEGATIVE_8K")
 BULLISH = ("INSIDER_BUYING", "POSITIVE_8K")
 
 
@@ -55,10 +55,12 @@ def signal_tags(form_types, reasons):
         tags.append("GOING_CONCERN")
     if "insiders sold" in reasons_l:
         tags.append("INSIDER_SELLING")
-    if "insiders bought" in reasons_l:
+    if "insiders bought" in reasons_l or "executive bought" in reasons_l:
         tags.append("INSIDER_BUYING")
     if "positive 8-k" in reasons_l:
         tags.append("POSITIVE_8K")
+    if "negative 8-k" in reasons_l:
+        tags.append("NEGATIVE_8K")
     if any(f in ("NT 10-Q", "NT 10-K") for f in forms):
         tags.append("LATE_FILING")
     if any(f in ("SC 13D", "SCHEDULE 13D") for f in forms):
@@ -218,7 +220,14 @@ def close_record(trade, exit_price, exit_date, reason, qty):
     }
 
 
-# ---------------------------------------------------------------- option spreads
+# ---------------------------------------------------------------- options
+
+def option_style(score):
+    """High-conviction signals get a plain long call or put. Everything else gets a defined-risk spread."""
+    if C.OPTION_SINGLE_ENABLED and is_num(score) and score >= C.OPTION_SINGLE_MIN_SCORE:
+        return "single"
+    return "spread"
+
 
 def spread_legs(direction, chain):
     """Returns (long_leg, short_leg, right) for the spread that fits the direction, or None.
@@ -234,7 +243,22 @@ def spread_legs(direction, chain):
     return None
 
 
-def option_ideas(direction, price, chain):
+def option_legs(direction, chain, style="spread"):
+    """Returns (long_leg, short_leg, right). For a single option the short leg is None."""
+    if style != "single":
+        return spread_legs(direction, chain)
+    if not chain:
+        return None
+    if direction == "SHORT":
+        leg, right = chain.get("atm_put"), "P"
+    else:
+        leg, right = chain.get("atm_call"), "C"
+    if leg and is_num(leg.get("mid")):
+        return leg, None, right
+    return None
+
+
+def option_ideas(direction, price, chain, style="spread"):
     """chain has atm_call, atm_put, otm_call, otm_put quotes (or None) plus expiry and dte."""
     out = {}
     if not chain:
@@ -250,33 +274,66 @@ def option_ideas(direction, price, chain):
     if ivs:
         out["opt_atm_iv"] = sum(ivs) / len(ivs)
 
-    legs = spread_legs(direction, chain)
-    if legs:
-        long_leg, short_leg, right = legs
-        name = "Bear put spread" if right == "P" else "Bull call spread"
-        debit = long_leg["mid"] - short_leg["mid"]
-        width = abs(long_leg["strike"] - short_leg["strike"])
-        if debit > 0 and width > debit:
+    legs = option_legs(direction, chain, style)
+    if not legs:
+        return out
+    long_leg, short_leg, right = legs
+    if short_leg is None:
+        name = "Long put" if right == "P" else "Long call"
+        debit = long_leg["mid"]
+        if debit > 0:
             out["spread_type"] = name
-            out["spread_legs"] = (
-                f"Buy {long_leg['strike']:g}{right} / Sell {short_leg['strike']:g}{right} "
-                f"exp {chain.get('expiry', '')}"
-            )
+            out["spread_legs"] = f"Buy {long_leg['strike']:g}{right} exp {chain.get('expiry', '')}"
             out["spread_debit"] = debit
-            out["spread_max_profit"] = width - debit
             out["spread_breakeven"] = (
                 long_leg["strike"] - debit if right == "P" else long_leg["strike"] + debit
             )
             for greek in ("delta", "gamma", "vega", "theta"):
-                a, b = long_leg.get(greek), short_leg.get(greek)
-                if is_num(a) and is_num(b):
-                    out["spread_" + greek] = a - b
+                value = long_leg.get(greek)
+                if is_num(value):
+                    out["spread_" + greek] = value
+        return out
+
+    name = "Bear put spread" if right == "P" else "Bull call spread"
+    debit = long_leg["mid"] - short_leg["mid"]
+    width = abs(long_leg["strike"] - short_leg["strike"])
+    if debit > 0 and width > debit:
+        out["spread_type"] = name
+        out["spread_legs"] = (
+            f"Buy {long_leg['strike']:g}{right} / Sell {short_leg['strike']:g}{right} "
+            f"exp {chain.get('expiry', '')}"
+        )
+        out["spread_debit"] = debit
+        out["spread_max_profit"] = width - debit
+        out["spread_breakeven"] = (
+            long_leg["strike"] - debit if right == "P" else long_leg["strike"] + debit
+        )
+        for greek in ("delta", "gamma", "vega", "theta"):
+            a, b = long_leg.get(greek), short_leg.get(greek)
+            if is_num(a) and is_num(b):
+                out["spread_" + greek] = a - b
     return out
 
 
+def _wide_leg(leg):
+    bid, ask, mid = leg.get("bid"), leg.get("ask"), leg.get("mid")
+    if is_num(bid) and is_num(ask) and is_num(mid) and bid > 0 and ask > 0 and mid > 0:
+        return (ask - bid) / mid > C.OPTION_MAX_LEG_GAP_PCT
+    return False
+
+
 def spread_problem(ideas, long_leg, short_leg):
-    """Returns None when the spread is fine to trade, otherwise a short reason it was skipped."""
+    """Returns None when the option is fine to trade, otherwise a short reason it was skipped.
+    short_leg is None for a plain long call or put."""
     debit, max_profit = ideas.get("spread_debit"), ideas.get("spread_max_profit")
+    if short_leg is None:
+        if not is_num(debit):
+            return "no usable option prices"
+        if debit < C.OPTION_SINGLE_MIN_PRICE:
+            return f"option costs under ${C.OPTION_SINGLE_MIN_PRICE:.2f} a share"
+        if _wide_leg(long_leg):
+            return "option prices are too wide (bid and ask far apart)"
+        return None
     if not (is_num(debit) and is_num(max_profit)):
         return "no usable spread prices"
     if debit < C.OPTION_MIN_DEBIT:
@@ -284,30 +341,35 @@ def spread_problem(ideas, long_leg, short_leg):
     if max_profit / debit < C.OPTION_MIN_REWARD_RISK:
         return "best case is smaller than the cost"
     for leg in (long_leg, short_leg):
-        bid, ask, mid = leg.get("bid"), leg.get("ask"), leg.get("mid")
-        if is_num(bid) and is_num(ask) and is_num(mid) and bid > 0 and ask > 0 and mid > 0:
-            if (ask - bid) / mid > C.OPTION_MAX_LEG_GAP_PCT:
-                return "option prices are too wide (bid and ask far apart)"
+        if _wide_leg(leg):
+            return "option prices are too wide (bid and ask far apart)"
     return None
 
 
-def size_spread(equity, debit):
-    """How many spreads to buy so the most we can lose is OPTION_RISK_PCT of the account."""
-    per_spread = debit * 100.0
-    if not (is_num(per_spread) and per_spread > 0):
+def size_spread(equity, debit, risk_pct=None):
+    """How many to buy so the most we can lose is the option budget (a share of the account)."""
+    per_contract = debit * 100.0
+    if not (is_num(per_contract) and per_contract > 0):
         return 0
-    count = int(math.floor(equity * C.OPTION_RISK_PCT / per_spread))
+    risk_pct = C.OPTION_RISK_PCT if risk_pct is None else risk_pct
+    count = int(math.floor(equity * risk_pct / per_contract))
     return max(0, min(count, C.OPTION_MAX_CONTRACTS))
 
 
 def option_exit_reason(opt, mid, today, underlying_open):
-    """opt is an open spread record. mid is the spread's current value per share, or None."""
+    """opt is an open option record. mid is its current value per share, or None."""
     expiry = parse_date(opt.get("expiry", ""))
     if expiry and (expiry - today).days <= C.OPTION_CLOSE_DTE:
         return "near expiry"
     if not underlying_open:
         return "stock trade closed"
     if is_num(mid):
+        if opt.get("style") == "single":
+            if mid >= opt["entry_debit"] * (1 + C.OPTION_SINGLE_TAKE_PROFIT_PCT):
+                return "profit target"
+            if mid <= opt["entry_debit"] * (1 - C.OPTION_SINGLE_STOP_LOSS_PCT):
+                return "stop loss"
+            return None
         if mid - opt["entry_debit"] >= C.OPTION_TAKE_PROFIT_PCT * opt["max_profit"]:
             return "profit target"
         if mid <= opt["entry_debit"] * (1 - C.OPTION_STOP_LOSS_PCT):
@@ -321,12 +383,13 @@ def close_option_record(opt, exit_price, exit_date, reason, qty):
     cost = opt["entry_debit"] * mult * qty
     entry = parse_date(opt["entry_date"])
     word = "put" if opt["right"] == "P" else "call"
+    single = opt.get("style") == "single"
     return {
         "trade_id": opt["trade_id"],
-        "symbol": f"{opt['symbol']} {word} spread",
+        "symbol": f"{opt['symbol']} long {word}" if single else f"{opt['symbol']} {word} spread",
         "company": opt["company"],
-        "direction": f"{opt['direction']} SPREAD",
-        "tags": list(opt["tags"]) + ["OPTION_SPREAD"],
+        "direction": f"{opt['direction']} OPTION" if single else f"{opt['direction']} SPREAD",
+        "tags": list(opt["tags"]) + ["OPTION_SINGLE" if single else "OPTION_SPREAD"],
         "score": opt["score"],
         "qty": qty,
         "entry_date": opt["entry_date"],
