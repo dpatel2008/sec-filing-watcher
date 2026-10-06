@@ -25,7 +25,9 @@ MIN_SCORE_TO_TRADE_LONG = 35     # bullish signals (buys)
 TRADE_LONGS = True               # insider-buying clusters and good-news 8-Ks
 MAX_SIGNAL_AGE_DAYS = 5
 MAX_CANDIDATES_TO_ANALYZE = 25
-MAX_NEW_TRADES_PER_RUN = 5
+MAX_NEW_TRADES_PER_RUN = 5       # all new trades together
+MAX_NEW_SHORTS_PER_RUN = 3       # of those, at most this many shorts
+MAX_NEW_LONGS_PER_RUN = 2        # and at most this many longs, so longs are never crowded out
 MAX_OPEN_POSITIONS = 10
 TRADE_13D_LONGS = False      # the SEC list can show the filer instead of the target
 
@@ -72,5 +74,12 @@ OPTION_LIMIT_SLIPPAGE = 0.05     # buy up to 5% above the middle price, sell dow
 OPTION_TAKE_PROFIT_PCT = 0.75    # close at 75% of the best case
 OPTION_STOP_LOSS_PCT = 0.60      # close after losing 60% of what was paid
 OPTION_CLOSE_DTE = 5             # close when this few days are left before expiry
+
+# Plain long calls and puts (instead of a spread) for the strongest signals. Worst case is the money paid.
+OPTION_SINGLE_ENABLED = True
+OPTION_SINGLE_MIN_SCORE = 50         # signals scoring this much or more get a single call or put
+OPTION_SINGLE_MIN_PRICE = 0.30       # skip options costing under $0.30 a share
+OPTION_SINGLE_TAKE_PROFIT_PCT = 1.0  # close after the option doubles (gains 100%)
+OPTION_SINGLE_STOP_LOSS_PCT = 0.50   # close after losing half of what was paid
 
 ORDER_WAIT_SECONDS = 30
