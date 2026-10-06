@@ -28,7 +28,7 @@ TRADE_13D_LONGS = False      # the SEC list can show the filer instead of the ta
 MIN_PRICE = 2.0
 MIN_AVG_DOLLAR_VOLUME = 500_000
 MAX_PCT_OF_DAILY_VOLUME = 0.05
-HISTORY_VOLUME_MULTIPLIER = 100   # IBKR reports US stock volume in lots of 100
+HISTORY_VOLUME_MULTIPLIER = 1   # IBKR reports US stock volume in lots of 100
 
 # Sizing and exits.
 RISK_PER_TRADE_PCT = 0.005   # risk 0.5% of account value per trade
