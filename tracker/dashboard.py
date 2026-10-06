@@ -89,14 +89,23 @@ def curve_svg(curve):
     )
 
 
+def spread_text(p):
+    status = p.get("spread_status") or "-"
+    if _f(p.get("spread_qty")):
+        return f'{status}: {int(_f(p["spread_qty"]))} for {money(p.get("spread_cost"))}'
+    return status
+
+
 def render(r):
     expo = r["exposure"]
     open_pnl = sum(row["pnl"] for row in r["open_rows"])
+    option_pnl = sum(o["pnl"] for o in r.get("option_rows", []) if o["pnl"] is not None)
     closed_pnl = r["trade_stats"]["total_pnl"]
 
     tiles = "".join([
         tile("Account value", money(r["equity"])),
         tile("Open P&L", money(open_pnl, True), tone(open_pnl)),
+        tile("Open option P&L", money(option_pnl, True), tone(option_pnl)),
         tile("Closed P&L", money(closed_pnl, True), tone(closed_pnl)),
         tile("Gross exposure", money(expo["gross"])),
         tile("Net exposure", money(expo["net"], True)),
@@ -112,9 +121,9 @@ def render(r):
             td(num(p.get("stop"))), td(num(p.get("target"))),
             td(num(p.get("beta"))), td(p.get("shortable_level") if p.get("shortable_level") not in (None, "") else "-"),
             td(p.get("decision"), "dec-" + str(p.get("decision", "")).lower().replace(" ", "")),
-            td(p.get("decision_reason")), td(p.get("flags")),
+            td(p.get("decision_reason")), td(spread_text(p)), td(p.get("flags")),
         ])
-    plan_html = table(["Symbol", "Side", "Score", "Qty", "Size", "Stop", "Target", "Beta", "Borrow", "Decision", "Why", "Flags"],
+    plan_html = table(["Symbol", "Side", "Score", "Qty", "Size", "Stop", "Target", "Beta", "Borrow", "Decision", "Why", "Option spread", "Flags"],
                       plan_rows, "No plan yet. Run the tracker in plan or trade mode.")
 
     open_rows = [[
@@ -124,6 +133,23 @@ def render(r):
     ] for o in r["open_rows"]]
     open_html = table(["Symbol", "Side", "Qty", "Entry", "Now", "P&L", "P&L %", "Stop", "Target", "Exit by", "Days", "Signals"],
                       open_rows, "No open paper trades.")
+
+    spread_open = [[
+        td(o["symbol"]), td(o["kind"]), td(o["legs"]), td(o["expiry"]), td(o["qty"]),
+        td(money(o["max_loss"])), td(money(o["max_profit"])), td(num(o["entry_debit"])),
+        td(num(o["mid"]) if o["mid"] is not None else "-"),
+        td(money(o["pnl"], True) if o["pnl"] is not None else "-", tone(o["pnl"])), td(o["entry_date"]),
+    ] for o in r.get("option_rows", [])]
+    spread_open_html = table(
+        ["Symbol", "Type", "Legs", "Expires", "Spreads", "Most it can lose", "Best case", "Paid", "Now", "P&L", "Opened"],
+        spread_open, "No open option spreads.",
+    )
+
+    events = r.get("events") or []
+    events_html = (
+        "<ul>" + "".join(f"<li>{esc(line)}</li>" for line in events) + "</ul>"
+        if events else '<p class="empty">No orders were placed in this run.</p>'
+    )
 
     h = r["hedge_info"]
     if h:
@@ -195,7 +221,7 @@ def render(r):
         td(num(p.get("spread_delta"), 2)), td(num(p.get("spread_gamma"), 3)), td(num(p.get("spread_vega"), 2)), td(num(p.get("spread_theta"), 2)),
     ] for p in r["plan"] if p.get("spread_type")]
     option_html = table(["Symbol", "Side", "Idea", "Legs", "Cost / spread", "Max profit", "Breakeven", "ATM IV", "Implied move", "Delta", "Gamma", "Vega", "Theta"],
-                        option_rows, "No option ideas yet (needs options data from IBKR).")
+                        option_rows, "No option spread ideas yet (needs options data from IBKR).")
 
     notes = []
     if r["spy_adv"] is not None:
@@ -216,6 +242,7 @@ def render(r):
     .pos{color:#34d399}.neg{color:#f87171}.empty,.note{color:#6b7280;font-size:13px;margin:8px 0}
     .dec-trade,.dec-filled{color:#34d399;font-weight:700}.dec-notfilled{color:#f87171;font-weight:700}.dec-skip{color:#9ca3af}
     p{font-size:14px;line-height:1.5;margin:6px 0}
+    ul{margin:6px 0 6px 20px;font-size:14px;line-height:1.6}
     """
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -223,14 +250,17 @@ def render(r):
 <h1>SEC Signal Tracker (paper account)</h1>
 <div class="sub">Account {esc(r["account_id"])} - generated {esc(r["generated"])}</div>
 <div class="tiles">{tiles}</div>
+<h2>What happened in the last run</h2>{events_html}
 <h2>Today's trade plan</h2>{plan_html}
 <h2>Open paper trades</h2>{open_html}
+<h2>Open option spreads</h2>{spread_open_html}
+<p class="note">Option spreads are not counted in the exposure, hedge or risk numbers. Their worst case is the amount paid.</p>
 <h2>Hedge</h2>{hedge_html}
 <h2>Risk</h2>{risk_html}{stress_html}
 <h2>Performance</h2>{perf_html}
 <h2>Results by signal type</h2>{stat_html}
 <h2>Recent closed trades</h2>{recent_html}
-<h2>Option ideas (not traded)</h2>{option_html}
+<h2>Option spread ideas for today's plan</h2>{option_html}
 <p class="note">{esc(" ".join(notes))}</p>
 </body></html>
 """
