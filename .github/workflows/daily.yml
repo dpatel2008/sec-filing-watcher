@@ -5,12 +5,13 @@ on:
     - cron: '17 11 * * 2-6'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   run-script:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -23,11 +24,14 @@ jobs:
       - name: Get the latest EDGAR filings
         run: python sec_daily_watcher.py
 
-      - name: Check for insider-selling clusters
+      - name: Check for insider-selling and insider-buying clusters
         run: python form4_cluster_check.py
 
       - name: Check for going concern language
         run: python going_concern_check.py
+
+      - name: Check 8-Ks for good news
+        run: python positive_8k_check.py
 
       - name: Look up tickers
         run: python ticker_lookup.py
@@ -49,8 +53,8 @@ jobs:
 
       - name: Save results to the repo
         run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -f daily_signals_ranked.csv
           git commit -m "Update daily results" || echo "Nothing new to save"
           git push
@@ -66,7 +70,7 @@ jobs:
           to: ${{ secrets.EMAIL_TO }}
           from: SEC Filing Watcher
           body: "Attached: the ranked report (open dashboard.html first) plus the raw data files."
-          attachments: dashboard.html,daily_signals_ranked.csv,form4_clusters.csv,going_concern_flags.csv,market_context.csv,all_filings.csv
+          attachments: dashboard.html,daily_signals_ranked.csv,form4_clusters.csv,form4_buys.csv,going_concern_flags.csv,positive_8k_flags.csv,market_context.csv,all_filings.csv
 
       - uses: actions/upload-artifact@v4
         with:
@@ -75,6 +79,8 @@ jobs:
             dashboard.html
             daily_signals_ranked.csv
             form4_clusters.csv
+            form4_buys.csv
             going_concern_flags.csv
+            positive_8k_flags.csv
             market_context.csv
             all_filings.csv
