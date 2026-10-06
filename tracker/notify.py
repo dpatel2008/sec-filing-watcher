@@ -11,6 +11,8 @@ import smtplib
 import ssl
 from email.message import EmailMessage
 
+import certifi
+
 import config as C
 
 SETTINGS_FILE = os.path.join(C.DATA_DIR, "email_settings.json")
@@ -48,7 +50,7 @@ def send_email(subject, body, attachments=None):
         message.add_attachment(data, maintype="text", subtype="html", filename=os.path.basename(path))
 
     try:
-        context = ssl.create_default_context()
+        context = ssl.create_default_context(cafile=certifi.where())
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context, timeout=30) as server:
             server.login(settings["username"], settings["password"])
             server.send_message(message)
