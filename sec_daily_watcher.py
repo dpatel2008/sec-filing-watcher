@@ -9,6 +9,7 @@ weekend or holiday), the script steps back to the latest day that exists.
 """
 
 import csv
+import re
 import sys
 import requests
 from datetime import date, datetime, timedelta
@@ -63,7 +64,12 @@ def find_latest_index():
     return None, None
 
 
+TAIL = re.compile(r"(\d{8}|\d{4}-\d{2}-\d{2})\s+(edgar/\S+)\s*$")
+
+
 def parse_index(text: str):
+    """Reads each line from the right side (file name, then date, then CIK), so it still
+    works when the SEC's columns are not exactly where we expect."""
     lines = text.splitlines()
 
     start_idx = None
@@ -81,12 +87,18 @@ def parse_index(text: str):
         form_type = line[0:12].strip()
         if form_type not in FORM_TYPES:
             continue
-        company_name = line[12:74].strip()
-        cik = line[74:86].strip()
-        date_filed = line[86:98].strip()
-        file_name = line[98:].strip()
-        if not file_name:
+        tail = TAIL.search(line)
+        if not tail:
             continue
+        date_filed, file_name = tail.group(1), tail.group(2)
+        head = line[12:tail.start()]
+        if head.startswith("/A"):
+            continue  # an amendment such as SCHEDULE 13D/A, not a new filing
+        parts = head.split()
+        if not parts or not parts[-1].isdigit():
+            continue
+        cik = parts[-1]
+        company_name = head[:head.rstrip().rfind(cik)].strip()
         filings.append({
             "form_type": form_type,
             "company": company_name,
