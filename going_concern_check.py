@@ -25,10 +25,27 @@ HEADERS = {
 INPUT_CSV = "all_filings.csv"
 OUTPUT_CSV = "going_concern_flags.csv"
 
-SLEEP_BETWEEN_REQUESTS = 0.2
+SLEEP_BETWEEN_REQUESTS = 0.35
+MAX_ERRORS_IN_A_ROW = 5
 MAX_BYTES_TO_READ = 3_000_000
 MAX_FILINGS_TO_SCAN = 400
 OVERLAP_CHARS = 20_000
+
+
+def get_with_retry(url, headers, stream=False, timeout=30, tries=3):
+    """Gets a page from the SEC. If the SEC says "slow down" (429 or 503), waits and tries again."""
+    resp = None
+    for attempt in range(1, tries + 1):
+        resp = requests.get(url, headers=headers, stream=stream, timeout=timeout)
+        if resp.status_code in (429, 503) and attempt < tries:
+            wait = 20 * attempt
+            print(f"  The SEC asked us to slow down ({resp.status_code}). Waiting {wait} seconds...")
+            resp.close()
+            time.sleep(wait)
+            continue
+        return resp
+    return resp
+
 
 PATTERN = re.compile(r"substantial doubt.{0,150}?going concern", re.IGNORECASE)
 
@@ -67,7 +84,7 @@ def scan_filing(url: str):
     bytes_read = 0
     tail = ""
 
-    with requests.get(url, headers=HEADERS, stream=True, timeout=30) as resp:
+    with get_with_retry(url, HEADERS, stream=True, timeout=30) as resp:
         resp.raise_for_status()
         for chunk in resp.iter_content(chunk_size=65536):
             if not chunk:
@@ -100,10 +117,12 @@ def main():
     print(f"Scanning {len(target_rows)} 10-K/10-Q filing(s)...")
 
     flagged = []
+    errors_in_a_row = 0
 
     for row in target_rows:
         try:
             snippet = scan_filing(row["url"])
+            errors_in_a_row = 0
             if snippet:
                 flagged.append({
                     "company": row["company"],
@@ -115,6 +134,10 @@ def main():
                 })
         except requests.RequestException as e:
             print(f"  Error fetching {row['url']}: {e}")
+            errors_in_a_row += 1
+            if errors_in_a_row >= MAX_ERRORS_IN_A_ROW:
+                print("  Too many errors in a row. Stopping this check early and keeping what we have.")
+                break
         time.sleep(SLEEP_BETWEEN_REQUESTS)
 
     with open(OUTPUT_CSV, "w", newline="") as f:
