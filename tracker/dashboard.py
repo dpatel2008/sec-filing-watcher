@@ -123,7 +123,7 @@ def render(r):
             td(p.get("decision"), "dec-" + str(p.get("decision", "")).lower().replace(" ", "")),
             td(p.get("decision_reason")), td(spread_text(p)), td(p.get("flags")),
         ])
-    plan_html = table(["Symbol", "Side", "Score", "Qty", "Size", "Stop", "Target", "Beta", "Borrow", "Decision", "Why", "Option spread", "Flags"],
+    plan_html = table(["Symbol", "Side", "Score", "Qty", "Size", "Stop", "Target", "Beta", "Borrow", "Decision", "Why", "Option", "Flags"],
                       plan_rows, "No plan yet. Run the tracker in plan or trade mode.")
 
     open_rows = [[
@@ -141,8 +141,8 @@ def render(r):
         td(money(o["pnl"], True) if o["pnl"] is not None else "-", tone(o["pnl"])), td(o["entry_date"]),
     ] for o in r.get("option_rows", [])]
     spread_open_html = table(
-        ["Symbol", "Type", "Legs", "Expires", "Spreads", "Most it can lose", "Best case", "Paid", "Now", "P&L", "Opened"],
-        spread_open, "No open option spreads.",
+        ["Symbol", "Type", "Legs", "Expires", "Contracts", "Most it can lose", "Best case", "Paid", "Now", "P&L", "Opened"],
+        spread_open, "No open options.",
     )
 
     events = r.get("events") or []
@@ -220,8 +220,8 @@ def render(r):
         td(num(p.get("spread_breakeven"))), td(pct(p.get("opt_atm_iv"), 0)), td(pct(p.get("implied_move_pct"), 1)),
         td(num(p.get("spread_delta"), 2)), td(num(p.get("spread_gamma"), 3)), td(num(p.get("spread_vega"), 2)), td(num(p.get("spread_theta"), 2)),
     ] for p in r["plan"] if p.get("spread_type")]
-    option_html = table(["Symbol", "Side", "Idea", "Legs", "Cost / spread", "Max profit", "Breakeven", "ATM IV", "Implied move", "Delta", "Gamma", "Vega", "Theta"],
-                        option_rows, "No option spread ideas yet (needs options data from IBKR).")
+    option_html = table(["Symbol", "Side", "Idea", "Legs", "Cost / contract", "Max profit", "Breakeven", "ATM IV", "Implied move", "Delta", "Gamma", "Vega", "Theta"],
+                        option_rows, "No option ideas yet (needs options data from IBKR).")
 
     notes = []
     if r["spy_adv"] is not None:
@@ -253,14 +253,14 @@ def render(r):
 <h2>What happened in the last run</h2>{events_html}
 <h2>Today's trade plan</h2>{plan_html}
 <h2>Open paper trades</h2>{open_html}
-<h2>Open option spreads</h2>{spread_open_html}
-<p class="note">Option spreads are not counted in the exposure, hedge or risk numbers. Their worst case is the amount paid.</p>
+<h2>Open options</h2>{spread_open_html}
+<p class="note">Options (spreads and single calls or puts) are not counted in the exposure, hedge or risk numbers. Their worst case is the amount paid.</p>
 <h2>Hedge</h2>{hedge_html}
 <h2>Risk</h2>{risk_html}{stress_html}
 <h2>Performance</h2>{perf_html}
 <h2>Results by signal type</h2>{stat_html}
 <h2>Recent closed trades</h2>{recent_html}
-<h2>Option spread ideas for today's plan</h2>{option_html}
+<h2>Option ideas for today's plan</h2>{option_html}
 <p class="note">{esc(" ".join(notes))}</p>
 </body></html>
 """
