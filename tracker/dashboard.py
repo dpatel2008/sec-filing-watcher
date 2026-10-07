@@ -152,7 +152,9 @@ def render(r):
     )
 
     h = r["hedge_info"]
-    if h:
+    if h and "net_beta_dollars" not in h:
+        hedge_html = f'<p>Hedge was not rebalanced this run: <b>{esc(h.get("status"))}</b>.</p>'
+    elif h:
         hedge_html = (
             f'<p>Net beta exposure of the stock book: <b>{esc(money(h["net_beta_dollars"], True))}</b>. '
             f'Target hedge: <b>{esc(money(h["hedge_dollars"], True))}</b> of {esc(h["symbol"])} '
@@ -263,4 +265,3 @@ def render(r):
 <h2>Option ideas for today's plan</h2>{option_html}
 <p class="note">{esc(" ".join(notes))}</p>
 </body></html>
-"""
