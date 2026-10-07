@@ -265,3 +265,4 @@ def render(r):
 <h2>Option ideas for today's plan</h2>{option_html}
 <p class="note">{esc(" ".join(notes))}</p>
 </body></html>
+"""
