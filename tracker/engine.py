@@ -17,6 +17,7 @@ import requests
 import analytics as A
 import config as C
 import dashboard
+import risk
 
 ET = ZoneInfo("America/New_York")
 
@@ -730,6 +731,14 @@ def run(mode, broker, signals_path=None, force=False, today=None):
         signals = load_signals(signals_path)
         print(f"Loaded {len(signals)} ranked signal(s).")
         plan = build_plan(session, signals, equity, {t["symbol"] for t in open_trades}, today, len(open_options))
+        try:
+            guard_notes = risk.apply_entry_guards(plan, session, open_trades, equity, today)
+        except Exception as exc:                       # a guard problem must never stop the tracker
+            guard_notes = [f"safety checks skipped because of an error: {exc}"]
+        for note in guard_notes:
+            print(f"  [GUARD] {note}")
+            if mode == "trade":
+                events.append(f"Guard: {note}")
 
     if mode == "trade":
         execute_plan(broker, plan, open_trades, open_options, today, events)
