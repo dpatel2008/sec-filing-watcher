@@ -52,8 +52,8 @@ def main():
         "high",
     )
     output = open(os.path.join(C.DATA_DIR, "gateway_output.log"), "a")
-    subprocess.Popen(
-        ["/bin/bash", START_SCRIPT], stdout=output, stderr=output, start_new_session=True
+    subprocess.Popen(                         # -inline: run here in the background, no Terminal window needed
+        ["/bin/bash", START_SCRIPT, "-inline"], stdout=output, stderr=output, start_new_session=True
     )
 
     waited = 0
