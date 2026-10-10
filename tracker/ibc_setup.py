@@ -36,16 +36,18 @@ def find_ibc_dir():
 
 
 def find_gateway():
-    """Returns (version like '1051', parent folder) for the newest IB Gateway in Applications."""
+    """Returns (version like '10.51', parent folder) for the newest IB Gateway.
+    On a Mac, IBC wants the version WITH the dot, because the install folder is named 'IB Gateway 10.51'."""
     best = None
-    for folder in glob.glob(os.path.join(HOME, "Applications", "IB Gateway *")):
-        match = re.search(r"IB Gateway (\d+)\.(\d+)", os.path.basename(folder))
-        if match:
-            version = (int(match.group(1)), int(match.group(2)))
-            if best is None or version > best[0]:
-                best = (version, os.path.dirname(folder))
+    for apps in (os.path.join(HOME, "Applications"), "/Applications"):
+        for folder in glob.glob(os.path.join(apps, "IB Gateway *")):
+            match = re.fullmatch(r"IB Gateway (\d+)\.(\d+)", os.path.basename(folder))
+            if match and os.path.isdir(folder):
+                version = (int(match.group(1)), int(match.group(2)))
+                if best is None or version > best[0]:
+                    best = (version, apps)
     if best:
-        return f"{best[0][0]}{best[0][1]}", best[1]
+        return f"{best[0][0]}.{best[0][1]}", best[1]
     return None, None
 
 
@@ -73,10 +75,17 @@ def setup():
         return
     version, tws_path = find_gateway()
     if not version:
-        version = input("I could not find IB Gateway. Type its version number without the dot (for example 1051): ").strip()
+        version = input("I could not find IB Gateway. Type its version number WITH the dot (for example 10.51): ").strip()
         tws_path = os.path.join(HOME, "Applications")
     print(f"IBC folder: {ibc}")
     print(f"IB Gateway version: {version} in {tws_path}")
+    if not os.path.isdir(os.path.join(tws_path, f"IB Gateway {version}", "jars")):
+        print()
+        print(f"STOP: there is no 'jars' folder in {os.path.join(tws_path, 'IB Gateway ' + version)}.")
+        print("Either the version number is wrong, or this IB Gateway is the self-updating kind (IBC only works")
+        print("with the OFFLINE kind). Download the OFFLINE 'IB Gateway Stable' for Mac from IBKR's website,")
+        print("install it, then run this again. Nothing was changed.")
+        return
     print()
     print("Use your PAPER trading login only.")
     username = input("IBKR paper username: ").strip()
@@ -119,11 +128,14 @@ def setup():
         "TWS_MAJOR_VRSN": version,
         "IBC_INI": paper_ini,
         "TRADING_MODE": "paper",
+        "TWOFA_TIMEOUT_ACTION": "restart",      # if the phone approval times out, try the login again
         "IBC_PATH": ibc,
         "TWS_PATH": tws_path,
-        "TWS_SETTINGS_PATH": os.path.join(HOME, "Jts"),
         "LOG_PATH": log_dir,
     }
+    jts = os.path.join(HOME, "Jts")             # where IB Gateway keeps its settings on a Mac
+    os.makedirs(jts, exist_ok=True)
+    values["TWS_SETTINGS_PATH"] = jts
     missing = []
     for key, value in values.items():
         start, found = set_value(start, key, value)
@@ -137,6 +149,7 @@ def setup():
 
     # Desktop icon
     icon = os.path.join(HOME, "Desktop", "Start Gateway.command")
+    os.makedirs(os.path.dirname(icon), exist_ok=True)
     with open(icon, "w") as f:
         f.write(f'#!/bin/bash\ncd "{PROJECT}" || exit 1\n"{PYTHON}" tracker/start_gateway.py\n')
     os.chmod(icon, os.stat(icon).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
@@ -147,6 +160,8 @@ def setup():
         print("Note: these lines were not in IBC's start file, so I added them at the bottom:", ", ".join(missing))
         print("If the start does not work, send me a screenshot of this message.")
     print("Test it: quit IB Gateway, then double-click Start Gateway.command and approve on your phone.")
+    print("Note: after IBC starts IB Gateway once, it renames the normal IB Gateway app so IBKR cannot restart it")
+    print("without IBC. From then on, open IB Gateway with the Start Gateway icon only.")
 
 
 def schedule(action):
