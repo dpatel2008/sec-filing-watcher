@@ -20,6 +20,20 @@ import engine  # noqa: E402
 import notify  # noqa: E402
 from broker_ib import IBBroker  # noqa: E402
 
+try:                                   # these two are optional, so the tracker still runs if a file is missing
+    import phone_alert  # noqa: E402
+except ImportError:
+    class phone_alert:                 # noqa: N801
+        @staticmethod
+        def send(*args, **kwargs):
+            return False
+try:
+    import sleeve_config as SC  # noqa: E402
+except ImportError:
+    class SC:                          # noqa: N801
+        SLEEVES_ENABLED = False
+        PUBLISH_RESULTS = False
+
 WINDOW_START = 9 * 60 + 35     # 9:35 AM Eastern
 WINDOW_END = 15 * 60 + 45      # 3:45 PM Eastern
 LAST_TRY = 10 * 60 + 55        # the last scheduled try; only then do we email "could not run"
@@ -99,6 +113,40 @@ def summarize(report, mode):
     return subject, "\n".join(lines)
 
 
+def run_sleeves(broker, mode):
+    """Runs the strategy sleeves after the tracker. Never lets a sleeve problem stop the tracker.
+    Returns (text for the email, page to attach or None, number of trades placed)."""
+    if not SC.SLEEVES_ENABLED:
+        return "", None, 0
+    try:
+        import sleeve_engine
+        from broker_extra import IBAdapter
+        report, path = sleeve_engine.run(mode, IBAdapter(broker), auto=True)
+        return sleeve_engine.summary_text(report), path, len(report["events"])
+    except SystemExit as e:
+        log(f"Sleeves stopped: {e}")
+        return f"STRATEGY SLEEVES\n  Stopped: {e}", None, 0
+    except Exception:
+        details = traceback.format_exc()
+        log("SLEEVES ERROR:\n" + details)
+        if mode == "trade":
+            phone_alert.send("Sleeves ERROR", "The strategy sleeves hit an error. The tracker itself was not affected.", "high")
+        return "STRATEGY SLEEVES\n  ERROR (the tracker itself was not affected):\n" + details[-800:], None, 0
+
+
+def capital_summary(broker, sleeves_on):
+    """The "capital by strategy" table for the email. Never stops the tracker."""
+    try:
+        import allocator
+        from broker_extra import IBAdapter
+        today = datetime.now(engine.ET).date().isoformat()
+        rows, totals, state = allocator.report(IBAdapter(broker), today, compute=sleeves_on)
+        return allocator.capital_text(rows, totals, state)
+    except (Exception, SystemExit) as e:
+        log(f"Capital table skipped: {e}")
+        return ""
+
+
 def main():
     plan_only = "--plan-only" in sys.argv
     mode = "plan" if plan_only else "trade"
@@ -125,11 +173,17 @@ def main():
     except SystemExit:
         log("IB Gateway is not running or not logged in to the paper account.")
         if not plan_only and minutes >= LAST_TRY:
+            phone_alert.send(
+                "Tracker did NOT run",
+                "IB Gateway was not logged in, so no trades were placed. Log in, then double-click "
+                "Run Tracker on your Desktop.",
+                "urgent",
+            )
             notify.send_email(
                 f"Tracker {today.isoformat()}: did NOT run",
                 "The tracker could not connect to IB Gateway, so no trades were placed today.\n\n"
                 "Open IB Gateway, choose IB API and Paper Trading, log in, then double-click "
-                "RunTracker.command on your Desktop to run it by hand.",
+                "Run Tracker on your Desktop to run it by hand.",
             )
         elif plan_only:
             print("Open IB Gateway, log in to the paper account, then try again.")
@@ -138,16 +192,51 @@ def main():
     try:
         report, path = engine.run(mode, broker)
         subject, body = summarize(report, mode)
-        sent = notify.send_email(subject, body, [path])
+        attachments = [path]
+        sleeve_text, sleeve_path, sleeve_trades = run_sleeves(broker, mode)
+        if sleeve_text:
+            body = body + "\n\n" + sleeve_text
+        if sleeve_path:
+            attachments.append(sleeve_path)
+        if "CAPITAL BY STRATEGY" not in body:
+            capital = capital_summary(broker, SC.SLEEVES_ENABLED)
+            if capital:
+                body = body + "\n\n" + capital
+        sent = notify.send_email(subject, body, attachments)
         log(f"Finished ({mode}). Email sent: {sent}. {subject}")
+        if not plan_only:
+            phone_alert.send("Tracker finished", f"{subject}; sleeves: {sleeve_trades} trade(s)")
+            if SC.PUBLISH_RESULTS:
+                try:
+                    import publish_results
+                    ok, message = publish_results.publish()
+                    log(f"Publish results: {message}")
+                except Exception:
+                    log("Publish results failed:\n" + traceback.format_exc())
+            plan = report["plan"]
+            no_quote = sum(1 for r in plan if "no quote" in (r.get("decision_reason") or ""))
+            if plan and no_quote >= max(3, len(plan) // 2):
+                phone_alert.send(
+                    "Tracker: quotes failed",
+                    f"{no_quote} of {len(plan)} stocks had no price from IBKR, so few or no trades "
+                    "were placed. Double-click Run Tracker on your Desktop in a few minutes.",
+                    "high",
+                )
     except SystemExit as e:
         log(f"Stopped: {e}")
         if not plan_only:
+            phone_alert.send("Tracker stopped", str(e)[:300], "high")
             notify.send_email(f"Tracker {today.isoformat()}: stopped", f"The tracker stopped with this message:\n\n{e}")
     except Exception:
         details = traceback.format_exc()
         log("ERROR:\n" + details)
         if not plan_only:
+            phone_alert.send(
+                "Tracker ERROR",
+                "The tracker hit an error. Some orders may have been placed. Open the dashboard "
+                "before running anything again.",
+                "urgent",
+            )
             notify.send_email(
                 f"Tracker {today.isoformat()}: ERROR",
                 "The tracker hit an error. Some orders may have been placed before it stopped, so open "
